@@ -1,0 +1,570 @@
+import asyncio
+import dataclasses
+import inspect
+import os
+from copy import deepcopy
+from typing import Any, List, Optional
+
+import ray
+import vllm
+from packaging import version
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from vllm.inputs import TokensPrompt
+from vllm.utils import random_uuid
+
+from molt.agents.base import Runner
+
+from molt.trainer.placement import get_bundle_indices, ray_noset_visible_devices
+
+_MIN_VLLM_VERSION = version.parse("0.21.0")
+
+
+def _assert_supported_vllm():
+    if version.parse(vllm.__version__) < _MIN_VLLM_VERSION:
+        raise RuntimeError(f"vLLM >= 0.21.0 is required, got {vllm.__version__}.")
+
+
+def _load_agent_runner(agent_path: str) -> Runner:
+    assert agent_path.endswith(".py"), "Agent path must be a Python file"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("agent_module", agent_path)
+    agent_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_module)
+
+    assert hasattr(agent_module, "AgentRunner"), "Agent module must contain AgentRunner class"
+    agent_runner_cls = agent_module.AgentRunner
+    assert issubclass(agent_runner_cls, Runner), "AgentRunner must inherit from Runner"
+    return agent_runner_cls()
+
+
+def _format_ray_gpu_ids(gpu_ids) -> str:
+    formatted = []
+    for gpu_id in gpu_ids:
+        try:
+            value = float(gpu_id)
+        except (TypeError, ValueError):
+            formatted.append(str(gpu_id))
+            continue
+        formatted.append(str(int(value)) if value.is_integer() else str(gpu_id))
+    return ",".join(formatted)
+
+
+def _vllm_worker_num_gpus(backend: Optional[str], actor_num_gpus: int) -> int:
+    # With vLLM's ray executor the top-level Ray actor is CPU-only for TP>1,
+    # while each child worker still needs one GPU from its placement-group
+    # bundle. Keep those resource concepts separate.
+    return 1 if backend == "ray" else actor_num_gpus
+
+
+def _async_engine_arg_names():
+    async_engine_args = vllm.AsyncEngineArgs
+    if dataclasses.is_dataclass(async_engine_args):
+        return {field.name for field in dataclasses.fields(async_engine_args) if field.init}
+
+    try:
+        signature = inspect.signature(async_engine_args)
+    except (TypeError, ValueError):
+        return None
+
+    parameters = signature.parameters.values()
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+        return None
+    return {
+        name
+        for name, param in signature.parameters.items()
+        if name != "self"
+        and param.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+
+
+def _filter_vllm_engine_kwargs(kwargs: dict) -> dict:
+    supported_args = _async_engine_arg_names()
+    if supported_args is None:
+        return dict(kwargs)
+
+    filtered = {key: value for key, value in kwargs.items() if key in supported_args}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        print(
+            "[vLLM] Skipping unsupported AsyncEngineArgs option(s): " + ", ".join(dropped),
+            flush=True,
+        )
+    return filtered
+
+
+@ray.remote
+class RolloutRayActor:
+    """Async vLLM-backed actor that exposes generation utilities."""
+
+    async def __init__(
+        self,
+        *args,
+        bundle_indices: list = None,
+        agent_path: Optional[str] = None,
+        mm_pad_token_ids: Optional[set] = None,
+        mm_image_placeholder_id: Optional[int] = None,
+        mm_image_start_ids: Optional[set] = None,
+        **kwargs,
+    ):
+        backend = kwargs.get("distributed_executor_backend")
+        num_gpus = kwargs.pop("num_gpus")
+        self._configure_device_env(
+            backend=backend,
+            bundle_indices=bundle_indices,
+            worker_num_gpus=kwargs.pop("worker_num_gpus", _vllm_worker_num_gpus(backend, num_gpus)),
+        )
+        self._configure_vllm_env(kwargs.pop("full_determinism", False))
+
+        if not agent_path:
+            raise ValueError("RolloutRayActor requires --train.agent_path.")
+        self.runner = _load_agent_runner(agent_path)
+
+        self.kwargs = kwargs
+
+        engine_args = vllm.AsyncEngineArgs(*args, **_filter_vllm_engine_kwargs(self.kwargs))
+        self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
+        print("vLLM AsyncLLMEngine constructed", flush=True)
+
+        # Used by generate() to collapse pre-expanded image/video pad tokens
+        # before passing to vLLM (avoids double-expansion).
+        self._mm_pad_token_ids = mm_pad_token_ids
+        self._mm_image_placeholder_id = mm_image_placeholder_id
+        # Start-marker ids: keep adjacent images distinct during dedup.
+        self._mm_image_start_ids = mm_image_start_ids
+        # Bumped on every weight broadcast; generate() reads it to detect a swap
+        # that lands mid-generation (partial rollout) and report the off-policy
+        # token boundary. Stays effectively unused when partial_rollout is off
+        # (the lock serializes broadcasts against rollout, so no generate spans one).
+        self._weight_version = 0
+
+    async def ready(self) -> bool:
+        """Confirm Ray actor construction has completed."""
+        return True
+
+    def _configure_device_env(self, backend, bundle_indices, worker_num_gpus):
+        if backend == "ray":
+            # vLLM's Ray executor launches child workers from the placement
+            # group bundles, so the parent rollout actor must not inherit a
+            # narrowed device list from Ray.
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        elif ray_noset_visible_devices():
+            # We need to set CUDA_VISIBLE_DEVICES to the ray assigned GPU
+            # when the distributed_executor_backend is not ray and Ray's
+            # CUDA visible-device management is disabled.
+            visible_devices = _format_ray_gpu_ids(ray.get_gpu_ids())
+            if visible_devices:
+                os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+
+        if bundle_indices is not None:
+            os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(worker_num_gpus)
+            os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
+            print(f"creating LLM with bundle_indices={bundle_indices}")
+
+    def _configure_vllm_env(self, full_determinism: bool):
+        _assert_supported_vllm()
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        if full_determinism:
+            # https://github.com/vllm-project/vllm/blob/effc5d24fae10b29996256eb7a88668ff7941aed/examples/offline_inference/reproduciblity.py#L11
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+        if not os.environ.get("RAY_ADDRESS"):
+            from ray._private.worker import global_worker
+
+            os.environ["RAY_ADDRESS"] = global_worker.gcs_client.address
+
+    async def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+        return await self.llm.collective_rpc(
+            "init_process_group",
+            args=(master_address, master_port, rank_offset, world_size, group_name, backend),
+        )
+
+    async def update_weights_packed(self, metas):
+        """Receive a single packed broadcast carrying many weights.
+
+        ``metas`` is a list of ``(name, dtype, shape)``. Producer (rank 0 in the
+        trainer) cats matching tensors into one buffer in the same order.
+        """
+        result = await self.llm.collective_rpc(
+            "update_weights_packed",
+            args=(metas,),
+        )
+        # New policy version is now live on the workers. generate() loops compare
+        # against this to mark tokens produced before the swap as off-policy.
+        self._weight_version += 1
+        return result
+
+    async def pause_generation(self):
+        await self.llm.pause_generation(mode="keep")
+
+    async def resume_generation(self):
+        await self.llm.resume_generation()
+
+    async def reset_prefix_cache(self):
+        """Invalidate the prefix KV cache.
+
+        Called after a weight broadcast: stale prefix-cache entries would otherwise
+        replay logits generated by the previous policy and silently corrupt rollout
+        logprobs. The trainer skips this when prefix caching is off (caller-gated).
+        """
+        await self.llm.reset_prefix_cache()
+
+    async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None):
+        """Token-level generation for rollout executors."""
+        if multi_modal_data and self._mm_pad_token_ids:
+            # Collapse consecutive image/video pad tokens to a single
+            # placeholder so vLLM's multimodal processor expands them
+            # exactly once (avoids double-expansion).
+            from molt.utils.vlm_utils import dedup_media_tokens
+
+            prompt_token_ids = dedup_media_tokens(
+                prompt_token_ids,
+                self._mm_pad_token_ids,
+                self._mm_image_placeholder_id,
+                image_start_ids=self._mm_image_start_ids,
+            )
+
+        prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        if multi_modal_data:
+            prompt["multi_modal_data"] = multi_modal_data
+
+        generator = self.llm.generate(
+            prompt,
+            deepcopy(sampling_params),
+            request_id=random_uuid(),
+        )
+
+        # Track the off-policy boundary for partial rollout: if a weight broadcast
+        # lands while this request is in flight (pause_generation freezes it, the
+        # weights swap, resume_generation continues it), every token produced
+        # BEFORE the swap was sampled by stale weights and is off-policy w.r.t. the
+        # post-swap weights the trainer recomputes against. We record the token
+        # count at the LATEST such swap; the agent runner passes it to
+        # Trajectory.append_action, which drops [:off_policy_len] from the action
+        # mask (slime's mask_offpolicy_in_partial_rollout — zero gradient AND out of
+        # the token-mean denominator). off_policy_len stays 0 when no swap spans
+        # this call, which is always the case with partial_rollout off (the
+        # vllm_lock serializes the broadcast against generation).
+        start_version = self._weight_version
+        off_policy_len = 0
+        final_output = None
+        async for request_output in generator:
+            if self._weight_version != start_version:
+                off_policy_len = len(request_output.outputs[0].token_ids)
+                start_version = self._weight_version
+            final_output = request_output
+
+        return final_output, off_policy_len
+
+    def get_num_unfinished_requests(self) -> int:
+        """Number of unfinished requests in vLLM engine."""
+        return self.llm.output_processor.get_num_unfinished_requests()
+
+    async def generate_responses(
+        self,
+        prompt: str,
+        label: str,
+        sampling_params,
+        max_length: int,
+        hf_tokenizer,
+        num_samples: int = 1,
+        images=None,
+    ):
+        """Generate N rollouts for a single prompt. Each `execute()` returns a
+        `Trajectory` (or, for custom runners, a list of them — multi-turn agents
+        may flatten to one sample per step). Tag every item with:
+          - `group_id`: one per prompt — N rollouts of this prompt share it,
+            so the trainer averages their rewards as the GRPO baseline.
+          - `rollout_id`: one per rollout — multi-turn step-samples of the
+            same rollout share it, so the trainer dedups to one reward each."""
+        from uuid import uuid4
+
+        group_id = uuid4().hex  # prompt-level: one per generate_responses call
+        tasks = [
+            self.runner.execute(
+                prompt=prompt,
+                label=label,
+                sampling_params=deepcopy(sampling_params),
+                max_length=max_length,
+                hf_tokenizer=hf_tokenizer,
+                llm_engine=self,
+                images=images,
+            )
+            for _ in range(num_samples)
+        ]
+        # return_exceptions=True: one failed rollout (vLLM hiccup, agent-runner
+        # error, overlong/prefix drift) must NOT take down the whole prompt group.
+        # Without it the exception propagates through the upstream
+        # ray.get(finished_rollout) and crashes the GenerateSamplesActor, killing
+        # the run. Drop the failed rollout(s) and keep the rest — slime (#1982)
+        # masks & continues the same way. If every rollout fails the group comes
+        # back empty and the generator refills its slot with a fresh prompt.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        flattened = []
+        for r in results:
+            if isinstance(r, BaseException):
+                print(f"[rollout] dropping failed rollout in group {group_id}: {r!r}", flush=True)
+                continue
+            rollout_id = uuid4().hex
+            for traj in r if isinstance(r, list) else [r]:
+                traj.group_id = group_id
+                traj.rollout_id = rollout_id
+                flattened.append(traj)
+        return flattened
+
+
+def create_vllm_engines(
+    num_engines: int,
+    tensor_parallel_size: int,
+    pretrain: str,
+    seed: int,
+    full_determinism: bool,
+    enforce_eager: bool,
+    max_model_len: int,
+    gpu_memory_utilization=0.95,
+    # vLLM V1 (default engine) computes logprobs from the RAW logits, BEFORE
+    # temperature/penalty scaling (LogprobsMode default "raw_logprobs"; see
+    # v1/sample/sampler.py). Our actor recomputes log-probs at the rollout
+    # temperature, so raw rollout log-probs would mismatch by the temperature
+    # factor and bias the TIS / vLLM-IS correction whenever rollout temperature
+    # != 1.0. "processed_logprobs" makes vLLM return post-temperature log-probs
+    # that align with the actor.
+    # Pass None to fall back to vLLM's raw behavior.
+    logprobs_mode="processed_logprobs",
+    agent_path: Optional[str] = None,
+    max_images_per_prompt: int = 0,
+    mm_encoder_attn_backend: Optional[str] = None,
+    gdn_prefill_backend: Optional[str] = None,
+    attention_backend: Optional[str] = None,
+    mamba_ssm_cache_dtype: Optional[str] = None,
+    distributed_executor_backend: Optional[str] = None,
+    enable_expert_parallel: bool = False,
+    # vLLM 0.21 EngineArgs accept None and resolve internally to its own default
+    # (prefix_caching True, chunked_prefill True, async_scheduling True for
+    # mp/uniproc executors). We override only `enable_prefix_caching` to False:
+    # RL weight broadcasts invalidate prefix-cached prefixes, and the user
+    # opts in via `--vllm.enable_prefix_caching` once they've validated logprob
+    # alignment on their recipe (broadcast_to_vllm calls reset_prefix_cache).
+    enable_prefix_caching: bool = False,
+    enable_chunked_prefill: Optional[bool] = None,
+    async_scheduling: Optional[bool] = None,
+    decode_context_parallel_size: int = 1,
+    dtype: str = "bfloat16",
+    mtp_num_speculative_tokens: int = 0,
+):
+    """Spin up a set of vLLM Ray actors on a dedicated placement group.
+
+    Async-split topology: vLLM engines run on different GPUs from the FSDP2
+    actor (no GPU sharing), so we always allocate a fresh placement group.
+
+    A single engine can span nodes via TP+EP (we do not use PP): with the
+    ``ray`` executor, a ``tensor_parallel_size`` larger than one node's GPU
+    count lays out one worker per single-GPU bundle across nodes. vLLM reads
+    ``VLLM_RAY_BUNDLE_INDICES`` and sorts the bundles by node itself (see
+    vllm/v1/executor/ray_executor.py); ``get_bundle_indices`` hands it a
+    node-grouped slice. E.g. Kimi-class MoE on 2x8 GPUs:
+    ``tensor_parallel_size=16 --vllm.enable_expert_parallel`` -> EP16
+    (EP = TP * DP, DP=1) across both nodes. ``mp``/``uni`` are single-node only
+    (a Ray bundle cannot span nodes), so cross-node engines need the ray backend.
+    """
+    _assert_supported_vllm()
+
+    # Detect VLM pad token IDs once, shared across all engines. Also pick up
+    # bracket-style border tokens (image_start_token / image_end_token) when
+    # the processor exposes them — pre-expanded prompts mix borders with
+    # pad runs, and dedup collapses the whole block to ``image_token_id`` for
+    # vLLM to re-expand exactly once.
+    mm_pad_token_ids: set = set()
+    mm_image_placeholder_id: Optional[int] = None
+    mm_image_start_ids: set = set()
+    if max_images_per_prompt > 0:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(pretrain, trust_remote_code=True)
+        for attr in ("image_token_id", "video_token_id"):
+            tid = getattr(processor, attr, None)
+            if tid is not None:
+                mm_pad_token_ids.add(tid)
+        mm_image_placeholder_id = getattr(processor, "image_token_id", None)
+        tokenizer = getattr(processor, "tokenizer", None)
+        for tok_attr in ("image_start_token", "image_end_token", "video_start_token", "video_end_token"):
+            tok_str = getattr(processor, tok_attr, None)
+            if tok_str and tokenizer is not None:
+                tid = tokenizer.convert_tokens_to_ids(tok_str)
+                if isinstance(tid, int) and tid >= 0:
+                    mm_pad_token_ids.add(tid)
+                    # Track the start markers separately: dedup uses them as
+                    # per-image boundaries so back-to-back image blocks don't
+                    # collapse into a single placeholder.
+                    if tok_attr in ("image_start_token", "video_start_token"):
+                        mm_image_start_ids.add(tid)
+        del processor
+
+    vllm_engines = []
+    distributed_executor_backend = distributed_executor_backend or ("uni" if tensor_parallel_size == 1 else "ray")
+    if distributed_executor_backend not in {"uni", "ray", "mp"}:
+        raise ValueError(
+            "vllm.distributed_executor_backend must be one of {'uni', 'ray', 'mp'}, "
+            f"got {distributed_executor_backend!r}."
+        )
+    if distributed_executor_backend == "uni" and tensor_parallel_size != 1:
+        raise ValueError("vLLM backend 'uni' only supports tensor_parallel_size=1; use 'ray' or 'mp' for TP > 1.")
+    num_gpus = tensor_parallel_size if distributed_executor_backend == "mp" else int(tensor_parallel_size == 1)
+    worker_num_gpus = _vllm_worker_num_gpus(distributed_executor_backend, num_gpus)
+
+    # mp executor: one Ray actor owns `tensor_parallel_size` GPUs (vLLM spawns
+    # the worker processes itself, single node only). ray executor: one
+    # single-GPU bundle per worker, so an engine's TP group can span nodes
+    # (cross-node TP+EP, e.g. Kimi-class 2x8). We don't use PP for vLLM.
+    if distributed_executor_backend == "mp":
+        bundles = [{"GPU": tensor_parallel_size, "CPU": tensor_parallel_size} for _ in range(num_engines)]
+    else:
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_engines * tensor_parallel_size)]
+    shared_pg = placement_group(bundles, strategy="PACK")
+    ray.get(shared_pg.ready())
+
+    for i in range(num_engines):
+        bundle_indices = None
+        if tensor_parallel_size > 1 and distributed_executor_backend == "ray":
+            # Node-grouped slice for engine i; vLLM re-sorts by node and spans
+            # nodes when TP exceeds one node's GPU count.
+            bundle_indices = get_bundle_indices(shared_pg, i, tensor_parallel_size)
+
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=shared_pg,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=bundle_indices[0] if bundle_indices else i,
+        )
+
+        actor_kwargs = {
+            "model": pretrain,
+            "enforce_eager": enforce_eager,
+            "worker_extension_cls": "molt.trainer.vllm.vllm_worker_wrap.WorkerWrap",
+            "tensor_parallel_size": tensor_parallel_size,
+            "seed": seed + i,
+            "distributed_executor_backend": distributed_executor_backend,
+            "max_model_len": max_model_len,
+            "enable_prefix_caching": enable_prefix_caching,
+            "decode_context_parallel_size": decode_context_parallel_size,
+            "dtype": dtype,
+            "trust_remote_code": True,
+            "full_determinism": full_determinism,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "bundle_indices": bundle_indices,
+            "num_gpus": num_gpus,
+            "worker_num_gpus": worker_num_gpus,
+            "agent_path": agent_path,
+            "mm_pad_token_ids": mm_pad_token_ids,
+            "mm_image_placeholder_id": mm_image_placeholder_id,
+            "mm_image_start_ids": mm_image_start_ids,
+        }
+
+        if max_images_per_prompt > 0:
+            actor_kwargs["limit_mm_per_prompt"] = {"image": max_images_per_prompt}
+            # Disable vLLM's mm preprocessor cache for VLM rollouts. The cache
+            # keys image features by content hash; after each weight broadcast
+            # cached entries become stale and the engine asserts on cache-miss
+            # (`mm_receiver_cache.get_and_update_item -> Expected a cached item`).
+            # Cost is recomputing image features per request — fine since the
+            # vision encoder is frozen and cheap relative to LM forward.
+            actor_kwargs["mm_processor_cache_gb"] = 0
+
+        # Pass-through only when the caller (or CLI) chose an explicit value, so
+        # vLLM's own None→auto resolution (see config/vllm.py:844 for async,
+        # config/scheduler.py:84 for chunked_prefill) stays the source of truth
+        # for the unset case.
+        if enable_chunked_prefill is not None:
+            actor_kwargs["enable_chunked_prefill"] = enable_chunked_prefill
+        if async_scheduling is not None:
+            actor_kwargs["async_scheduling"] = async_scheduling
+
+        if mm_encoder_attn_backend:
+            actor_kwargs["mm_encoder_attn_backend"] = mm_encoder_attn_backend
+
+        if gdn_prefill_backend:
+            actor_kwargs["gdn_prefill_backend"] = gdn_prefill_backend
+
+        if attention_backend:
+            # vLLM >=0.20 ignores the legacy VLLM_ATTENTION_BACKEND env var; the
+            # backend must be passed via EngineArgs (e.g. "TRITON_ATTN" to
+            # avoid AOT-compiled FlashAttention 2 PTX kernels on older drivers).
+            actor_kwargs["attention_backend"] = attention_backend
+
+        if mamba_ssm_cache_dtype:
+            # Hybrid Mamba2 models (NemotronH / omni3): vLLM's NemotronH config
+            # handler defaults the SSM state cache to float16 when unset (see
+            # vllm model_executor/models/config.py NemotronHForCausalLMConfig).
+            # A low-precision recurrent SSM cache accumulates rounding error
+            # across a long rollout, so vLLM rollout log-probs drift from the
+            # fp32 training recompute (omni3: vllm_kl ~0.034, which makes the
+            # seq-mask-TIS geometric-mean ratio sit at exp(-0.034)=0.966 and a
+            # tight band drop ~everything). Force fp32 to match training —
+            # opd-rl/nemo-rl set mamba_ssm_cache_dtype="float32" for nanov3vl.
+            # No-op for non-Mamba models (vLLM ignores it).
+            actor_kwargs["mamba_ssm_cache_dtype"] = mamba_ssm_cache_dtype
+
+        if enable_expert_parallel:
+            # vLLM TP+EP hybrid: non-MoE layers stay TP-sharded across `tensor_parallel_size`
+            # ranks; MoE experts are EP-distributed across the same ranks (one group per rank).
+            actor_kwargs["enable_expert_parallel"] = True
+
+        if logprobs_mode:
+            # Don't cap max_logprobs: the RL path only requests logprobs=1, but
+            # the OAI server may serve external top_logprobs>1; vLLM's default
+            # (20) covers both. Capping at 1 would reject those requests.
+            actor_kwargs["logprobs_mode"] = logprobs_mode
+
+        # MTP speculative decoding (rollout-side). method="mtp" is required: vLLM
+        # then resolves the per-architecture MTP draft from the served target's
+        # config (qwen3_5_moe -> qwen3_5_mtp / Qwen3_5MoeMTP, reading
+        # mtp_num_hidden_layers; see vllm config/speculative.py) and builds it from
+        # the target's own MTP head. A bare num_speculative_tokens would instead
+        # default to method="draft_model". Lossless: the target verifies every
+        # drafted token via rejection sampling, so the returned logprobs remain the
+        # target policy's (unbiased for the RL objective). The draft block is not
+        # hot-refreshed by weight-sync (vLLM exposes no such API), but it shares
+        # embed_tokens/lm_head with the target — which our broadcast DOES update — so
+        # it tracks the policy and acceptance degrades only gradually. We do not
+        # train the MTP head (matches verl/NeMo-RL: main-head-only RL loss). vLLM
+        # errors at init if the served checkpoint has no MTP head (e.g.
+        # Nemotron-Nano-Omni — see README).
+        if mtp_num_speculative_tokens and mtp_num_speculative_tokens > 0:
+            actor_kwargs["speculative_config"] = {
+                "method": "mtp",
+                "num_speculative_tokens": mtp_num_speculative_tokens,
+            }
+
+        vllm_engines.append(
+            RolloutRayActor.options(
+                num_cpus=num_gpus,
+                num_gpus=num_gpus,
+                scheduling_strategy=scheduling_strategy,
+            ).remote(**actor_kwargs)
+        )
+
+    # Ray returns actor handles before async actor initialization completes.
+    # Block here so FSDP rank 0 does not open the trainer<->vLLM weight-sync
+    # TCPStore while vLLM worker collectives are still queued behind startup.
+    ray.get([engine.ready.remote() for engine in vllm_engines])
+
+    return vllm_engines
+
+
+def batch_vllm_engine_call(engines: List[Any], method_name: str, *args, rank_0_only: bool = True, **kwargs):
+    """Call the same method on vLLM engines and gather results."""
+    import torch
+
+    if torch.distributed.is_initialized() and rank_0_only and torch.distributed.get_rank() != 0:
+        return None
+
+    refs = []
+    for engine in engines:
+        method = getattr(engine, method_name)
+        refs.append(method.remote(*args, **kwargs))
+    return ray.get(refs)

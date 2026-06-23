@@ -1,0 +1,728 @@
+import argparse
+import os
+
+from molt.trainer.algorithm.experience import get_model_parallel_size
+
+
+def train(args):
+    import ray
+    from ray.util.placement_group import placement_group
+
+    from molt.trainer.placement import model_placement_strategy
+    from molt.trainer.vllm import create_vllm_engines
+    from molt.trainer.workers.actor_group import RayActorGroup, ReferenceModelActor
+    from molt.trainer.workers.policy_actor import PolicyModelActor
+    from molt.utils import get_strategy
+
+    # initialize ray if not initialized
+    if not ray.is_initialized():
+        # Defaults respect user overrides (e.g. NCCL_DEBUG=INFO via
+        # `ray job submit --runtime-env-json`); the listed names are
+        # cache/workspace knobs vLLM and HF read inside Ray actors.
+        env_vars = {
+            "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "true"),
+            "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
+            "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS": os.environ.get("RAY_ENABLE_ZERO_COPY_TORCH_TENSORS", "1"),
+        }
+        for name in (
+            "FLASHINFER_WORKSPACE_BASE",
+            "FLASHINFER_WORKSPACE_DIR",
+            "HF_HOME",
+            "HF_HUB_CACHE",
+            "HUGGINGFACE_HUB_CACHE",
+            "TRANSFORMERS_CACHE",
+            "TORCH_COMPILE_DISABLE",
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "VLLM_WORKER_MULTIPROC_METHOD",
+        ):
+            if os.environ.get(name):
+                env_vars[name] = os.environ[name]
+        ray.init(runtime_env={"env_vars": env_vars})
+
+    # configure strategy
+    strategy = get_strategy(args)
+    strategy.print(args)
+
+    # Init vLLM before actor/ref placement. vLLM's mp backend asks Ray for
+    # whole-node bundles (for example 8 GPUs); if actor/ref one-GPU bundles are
+    # spread first, they fragment every node and the vLLM placement group can
+    # remain pending forever.
+    vllm_engines = None
+    # data.max_len is the shared total-context budget (prompt + generation),
+    # so vLLM's max_model_len reads it directly. For VLM (image-tokenized
+    # prompts) or multi-turn agents, set --data.max_len high enough to fit
+    # the longest expanded prompt plus rollout.max_new_tokens.
+    max_len = args.data.max_len
+    if args.vllm.num_engines is not None and args.vllm.num_engines > 0:
+        vllm_engines = create_vllm_engines(
+            args.vllm.num_engines,
+            args.vllm.tensor_parallel_size,
+            args.actor.model_name_or_path,
+            args.train.seed,
+            args.train.full_determinism_enable,
+            args.vllm.enforce_eager,
+            max_len,
+            args.vllm.gpu_memory_utilization,
+            "processed_logprobs" if args.algo.advantage.is_correction_enable else None,
+            agent_path=args.train.agent_path,
+            max_images_per_prompt=getattr(args.data, "max_images_per_prompt", 0),
+            mm_encoder_attn_backend=args.vllm.mm_encoder_attn_backend,
+            gdn_prefill_backend=args.vllm.gdn_prefill_backend,
+            attention_backend=args.vllm.attention_backend,
+            mamba_ssm_cache_dtype=args.vllm.mamba_ssm_cache_dtype,
+            distributed_executor_backend=args.vllm.distributed_executor_backend,
+            enable_expert_parallel=args.vllm.enable_expert_parallel,
+            enable_prefix_caching=args.vllm.enable_prefix_caching,
+            enable_chunked_prefill=args.vllm.enable_chunked_prefill,
+            async_scheduling=args.vllm.async_scheduling,
+            decode_context_parallel_size=args.vllm.decode_context_parallel_size,
+            dtype=args.vllm.dtype,
+            mtp_num_speculative_tokens=args.vllm.mtp_num_speculative_tokens,
+        )
+
+    # init actor / reference / critic models
+    # Colocating only affects FSDP models (actor + reference + critic); they
+    # time-slice one shared placement group sized to the actor. vLLM rollout
+    # engines keep their own placement group.
+    pg = None
+    has_ref = args.algo.kl.init_coef > 0
+    has_critic = args.algo.advantage.estimator == "gae"
+    colocate_fsdp_models = args.train.colocate_fsdp_models and (has_ref or has_critic)
+    if colocate_fsdp_models:
+        if has_ref:
+            assert (
+                args.actor.num_nodes == args.ref.num_nodes
+                and args.actor.num_gpus_per_node == args.ref.num_gpus_per_node
+            ), "num_nodes and num_gpus_per_node must match when colocating the actor and ref model."
+
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.actor.num_nodes * args.actor.num_gpus_per_node)]
+        pg = placement_group(bundles, strategy=model_placement_strategy())
+        ray.get(pg.ready())
+
+    fsdp_mp_size = get_model_parallel_size(args)
+
+    actor_model = RayActorGroup(
+        args.actor.num_nodes,
+        args.actor.num_gpus_per_node,
+        PolicyModelActor,
+        pg=pg,
+        num_gpus_per_actor=0.2 if pg else 1,
+        duplicate_actors=fsdp_mp_size,
+    )
+
+    if has_ref:
+        ref_model = RayActorGroup(
+            args.ref.num_nodes,
+            args.ref.num_gpus_per_node,
+            ReferenceModelActor,
+            pg=pg,
+            num_gpus_per_actor=0.2 if pg else 1,
+            duplicate_actors=fsdp_mp_size,
+        )
+    else:
+        ref_model = None
+
+    # PPO critic: its own group, colocated on the actor's GPUs via the shared
+    # placement group (same world size / mesh as the actor). Only for gae.
+    if has_critic:
+        from molt.trainer.workers.critic_actor import CriticModelActor
+
+        critic_model = RayActorGroup(
+            args.actor.num_nodes,
+            args.actor.num_gpus_per_node,
+            CriticModelActor,
+            pg=pg,
+            num_gpus_per_actor=0.2 if pg else 1,
+            duplicate_actors=fsdp_mp_size,
+        )
+    else:
+        critic_model = None
+
+    from molt.trainer.rl_trainer import RLTrainer
+
+    # init RL trainer (single controller)
+    policy_trainer = RLTrainer.remote(
+        args.actor.model_name_or_path,
+        strategy,
+        actor_model,
+        ref_model,
+        vllm_engines,
+        critic_model_group=critic_model,
+        # generate kwargs
+        do_sample=True,
+        max_len=max_len,
+        max_new_tokens=args.rollout.max_new_tokens,
+        temperature=args.rollout.temperature,
+        top_p=args.rollout.top_p,
+    )
+
+    # training update steps
+    max_steps = ray.get(policy_trainer.get_max_steps.remote())
+    # The actor's LR scheduler must be sized to the optimizer steps it ACTUALLY takes.
+    # With a PPO critic, the actor is frozen for the first `freezing_steps` (critic
+    # warmup) and never advances its scheduler then, so sizing it to the full
+    # `max_steps` would shift its warmup/decay and never reach min_lr. The critic
+    # trains every step, so it keeps the full `max_steps`.
+    actor_max_steps = max(1, max_steps - (args.actor.freezing_steps if has_critic else 0))
+
+    # init actor/reference models
+    refs = []
+    refs.extend(
+        actor_model.async_init_model_from_pretrained(
+            strategy, args.actor.model_name_or_path, actor_max_steps, vllm_engines
+        )
+    )
+    if ref_model is not None:
+        ref_path = args.ref.model_name_or_path or args.actor.model_name_or_path
+        refs.extend(ref_model.async_init_model_from_pretrained(strategy, ref_path))
+    if critic_model is not None:
+        refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.actor.model_name_or_path, max_steps))
+    ray.get(refs)
+
+    # train actor model
+    ray.get(policy_trainer.fit.remote())
+
+    # save model
+    if not args.ckpt.disable_final_save:
+        ray.get(actor_model.async_export_hf_model())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    from molt.cli.common_args import add_ckpt_args, add_fsdp_args, add_logger_args, add_optimizer_args
+
+    # ====================== Shared blocks (same surface as train_sft) ======================
+    # FSDP2 / AutoModel backend.
+    add_fsdp_args(parser)
+    # Optimizer + scheduler + grad clip for the actor ("actor." prefix + lr default 1e-6).
+    add_optimizer_args(parser, prefix="actor.", default_adam_lr=1e-6)
+    # Checkpoints; RL disables eval when --eval.steps is -1 and adds best-ckpt selection.
+    add_ckpt_args(parser, default_ckpt_path="./ckpt/checkpoints_rl_ray")
+    parser.add_argument(
+        "--ckpt.best_metric_key",
+        type=str,
+        default="",
+        help="Eval metric key for best checkpoint saving (e.g., eval_default_pass1). "
+        "Empty string auto-detects first pass1 metric. Set to 'none' to disable best checkpoint saving.",
+    )
+    # wandb + TensorBoard + logging cadence.
+    add_logger_args(parser, default_wandb_project="molt_train_rl", run_name_prefix="rl")
+
+    # ====================== RL-specific arguments ======================
+    # Model
+    parser.add_argument("--actor.model_name_or_path", type=str, default=None, help="HF model name or path")
+    parser.add_argument(
+        "--actor.gradient_checkpoint",
+        nargs="?",
+        const="full",
+        default="full",
+        help="Activation-checkpointing mode (string): 'full' = full-block AC (AutoModel "
+        "recipe default), 'selective' = TorchTitan per-op AC, 'none'/'off'/'' = disable.",
+    )
+    parser.add_argument("--actor.aux_loss_coef", type=float, default=0, help="MoE balancing loss")
+    parser.add_argument(
+        "--actor.freezing_steps",
+        type=int,
+        default=0,
+        help="Critic warmup: freeze the actor's policy update for the first N optimizer steps so "
+        "the value model fits the initial rollouts before its early, high-variance advantages move "
+        "the policy. The critic keeps training while frozen. 0 disables; only applies with "
+        "--algo.advantage.estimator gae.",
+    )
+    parser.add_argument(
+        "--actor.freeze_visual_encoder",
+        action="store_true",
+        default=False,
+        help="Freeze vision encoder weights (only train language model). Reduces memory and weight sync overhead.",
+    )
+    parser.add_argument(
+        "--ref.model_name_or_path",
+        type=str,
+        default=None,
+        help="Reference/teacher checkpoint. Defaults to the actor checkpoint (standard KL-to-init RL). "
+        "Set to a different (e.g. larger, same-tokenizer) model for on-policy distillation.",
+    )
+    # Critic (PPO value model; used only when --algo.advantage.estimator gae). It is
+    # colocated in the actor workers and reuses the actor's optimizer/parallelism config.
+    parser.add_argument(
+        "--critic.model_name_or_path",
+        type=str,
+        default=None,
+        help="Critic init checkpoint (a reward model or the policy). Defaults to the actor checkpoint.",
+    )
+    parser.add_argument(
+        "--critic.value_clip",
+        type=float,
+        default=0.2,
+        help="PPO value-clip range for the value loss.",
+    )
+    # Independent critic optimizer + scheduler + grad-clip ("critic." prefix), so the
+    # value model can use its own LR/optimizer (PPO critics often want a higher LR).
+    add_optimizer_args(parser, prefix="critic.", default_adam_lr=5e-6)
+
+    # Data
+    parser.add_argument("--data.prompt_dataset", type=str, default=None, help="HF dataset name or path")
+    parser.add_argument(
+        "--data.prompt_probs",
+        type=str,
+        default=None,
+        help="sampling probs for datasets",
+    )
+    parser.add_argument("--data.prompt_split", type=str, default="train")
+    parser.add_argument("--data.max_samples", type=int, default=int(1e8), help="Max number of samples")
+    parser.add_argument("--data.max_len", type=int, default=2048, help="Max total sequence length (prompt + response)")
+    parser.add_argument("--data.input_key", type=str, default="input", help="JSON dataset key")
+    parser.add_argument(
+        "--data.label_key",
+        type=str,
+        default=None,
+        help="Dataset column holding the ground-truth answer/label used for reward scoring.",
+    )
+    parser.add_argument(
+        "--data.tools_key",
+        type=str,
+        default=None,
+        help="Dataset key whose value is a list of OpenAI function-call schemas; rendered "
+        "into the chat template (see Qwen `tools=`) so the model is taught the native "
+        "<tool_call>{...}</tool_call> emission format without manual prompt engineering.",
+    )
+    parser.add_argument("--data.input_template", type=str, default=None)
+    parser.add_argument(
+        "--data.apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
+    )
+    parser.add_argument("--data.image_key", type=str, default="images", help="Dataset key for image paths/URLs")
+    parser.add_argument(
+        "--data.max_images_per_prompt", type=int, default=0, help="Max images per prompt for vLLM (0 = text-only)"
+    )
+    parser.add_argument("--data.disable_fast_tokenizer", action="store_true", default=False)
+    parser.add_argument(
+        "--data.dataloader_num_workers",
+        type=int,
+        default=0,
+        help="Number of dataloader workers for IO (for Ray training, ensure sufficient CPU resources per actor)",
+    )
+
+    # Algorithm: advantage estimation, KL, policy clipping, reward shaping
+    parser.add_argument(
+        "--algo.advantage.estimator",
+        type=str,
+        choices=["reinforce", "rloo", "reinforce_baseline", "grpo", "dr_grpo", "on_policy_distill", "gae"],
+        default="reinforce",
+        help="Advantage estimation method: reinforce, rloo, reinforce_baseline, grpo, dr_grpo, "
+        "on_policy_distill (per-token reverse KL to the --ref.model_name_or_path teacher), or gae "
+        "(PPO value baseline — builds a colocated critic; see --critic.*)",
+    )
+    parser.add_argument("--algo.advantage.gamma", type=float, default=1, help="discount factor")
+    parser.add_argument(
+        "--algo.advantage.lam",
+        type=float,
+        default=1.0,
+        help="GAE lambda (PPO only). 1.0 = Monte-Carlo return minus the value baseline.",
+    )
+    parser.add_argument(
+        "--algo.advantage.no_std_norm",
+        action="store_true",
+        default=False,
+        help="disable dividing by std for advantages while keeping mean normalization",
+    )
+    # Importance-sampling correction for async/off-policy rollout logprobs.
+    parser.add_argument("--algo.advantage.is_correction_enable", action="store_true", default=False)
+    parser.add_argument(
+        "--algo.advantage.is_correction_threshold",
+        type=float,
+        nargs=2,
+        default=[0.5, 5.0],
+        help=(
+            "Low and high thresholds for vLLM importance sampling correction. "
+            "TIS uses the high value as an upper cap; ICE-POP and seq-mask-tis use both bounds."
+        ),
+    )
+    parser.add_argument(
+        "--algo.advantage.is_correction_type",
+        type=str,
+        default="tis",
+        choices=["tis", "icepop", "seq-mask-tis"],
+        help="vLLM IS correction type: tis (token-level clamp), icepop (token-level filter), seq-mask-tis (sequence-level geom mean)",
+    )
+    parser.add_argument(
+        "--algo.kl.use_loss", action="store_true", default=False, help="whether to use KL loss from GRPO"
+    )
+    parser.add_argument(
+        "--algo.kl.estimator",
+        type=str,
+        default="k1",
+        choices=["k1", "k2", "k3"],
+        help=(
+            "In GRPO, k3 is utilized as the loss function, while k2, when used as the loss, is nearly equivalent to k1."
+        ),
+    )
+    parser.add_argument(
+        "--algo.kl.init_coef",
+        type=float,
+        default=None,
+        help="KL coefficient. Defaults to 0.01 (KL-to-init RL) or 1.0 (on_policy_distill reverse-KL reward).",
+    )
+    parser.add_argument("--algo.kl.target", type=float, default=None)
+    parser.add_argument("--algo.kl.horizon", type=int, default=10000)
+    parser.add_argument(
+        "--algo.dynamic_filtering_enable", action="store_true", default=False, help="Enable dynamic filtering"
+    )
+    parser.add_argument(
+        "--algo.dynamic_filtering_range", nargs=2, default=(0, 1), type=float, help="Dynamic filtering rewards range"
+    )
+    parser.add_argument(
+        "--actor.eps_clip_low_high", type=float, nargs=2, default=None, help="policy clip low and high"
+    )
+    parser.add_argument("--actor.dual_clip", type=float, default=None, help="Dual-clip policy objective")
+    parser.add_argument(
+        "--actor.entropy_coef",
+        type=float,
+        default=None,
+        help="Entropy loss coef, set to 0 means only enable entropy logs",
+    )
+    parser.add_argument("--reward.clip_range", type=float, nargs=2, default=(-10, 10), help="Reward clip range")
+
+    # Rollout / generation
+    parser.add_argument("--train.agent_path", type=str, default=None, help="Agent script path")
+    # -- vLLM engine --
+    parser.add_argument(
+        "--vllm.num_engines", type=int, default=None, help="number of vLLM Engines, set to 0 to disable vLLM"
+    )
+    parser.add_argument(
+        "--vllm.tensor_parallel_size",
+        type=int,
+        default=1,
+        help="tensor parallel size of vLLM Engine for multi-GPU inference",
+    )
+    parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
+    parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
+    parser.add_argument(
+        "--vllm.mtp_num_speculative_tokens",
+        type=int,
+        default=0,
+        help="MTP speculative-decoding tokens for rollout (0=off). >0 enables multi-token "
+        "prediction in vLLM; the draft is auto-detected from the checkpoint's MTP head "
+        "(Qwen3.6-MoE). Lossless (target verifies every token). 1 is a good default.",
+    )
+    parser.add_argument("--vllm.dtype", type=str, default="bfloat16", help="vLLM inference dtype")
+    parser.add_argument(
+        "--vllm.gpu_memory_utilization",
+        type=float,
+        default=0.95,
+        help="vLLM gpu_memory_utilization",
+    )
+    parser.add_argument(
+        "--vllm.mm_encoder_attn_backend",
+        type=str,
+        default=None,
+        help="Optional vLLM vision encoder attention backend, e.g. TORCH_SDPA.",
+    )
+    parser.add_argument(
+        "--vllm.gdn_prefill_backend",
+        type=str,
+        choices=("flashinfer", "triton"),
+        default=None,
+        help="Optional vLLM GDN prefill backend for Qwen3-style linear attention layers.",
+    )
+    parser.add_argument(
+        "--vllm.attention_backend",
+        type=str,
+        default=None,
+        help="Optional vLLM attention backend (FLASH_ATTN/FLASHINFER/TRITON_ATTN/FLEX_ATTENTION). "
+        "Pass TRITON_ATTN to bypass AOT-compiled FA2/FlashInfer kernels on older drivers.",
+    )
+    parser.add_argument(
+        "--vllm.mamba_ssm_cache_dtype",
+        type=str,
+        choices=("auto", "float32", "float16"),
+        default=None,
+        help="vLLM Mamba SSM state-cache dtype. Force 'float32' for hybrid Mamba2 models "
+        "(NemotronH/omni3): vLLM defaults NemotronH to float16, so the recurrent SSM scan "
+        "accumulates error over the rollout and rollout log-probs drift from the fp32 training "
+        "recompute (inflates vllm_kl / seq-mask-TIS filtering). Matches opd-rl/nemo-rl.",
+    )
+    parser.add_argument(
+        "--vllm.distributed_executor_backend",
+        type=str,
+        choices=("ray", "mp", "uni"),
+        default=None,
+        help="Optional vLLM distributed executor backend override.",
+    )
+    parser.add_argument(
+        "--vllm.enable_expert_parallel",
+        action="store_true",
+        default=False,
+        help="Enable vLLM TP+EP hybrid: experts EP-sharded across the TP ranks (Qwen3.5/3.6 MoE).",
+    )
+    # vLLM throughput features. We leave `chunked_prefill` and `async_scheduling`
+    # at None so vLLM 0.21's own auto-resolution decides (both default ON for
+    # non-encoder-decoder models with mp/uniproc executors). Prefix caching is
+    # an explicit opt-in: it changes the rollout→training logprob path because
+    # cached prefixes survive across weight updates; the trainer calls
+    # reset_prefix_cache after every broadcast (see broadcast_to_vllm) so
+    # enabling it is safe, but we keep it off by default until a recipe is
+    # validated end-to-end.
+    parser.add_argument(
+        "--vllm.enable_prefix_caching",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="vLLM prefix KV cache. Multi-turn rollouts re-prefill the growing history each turn; "
+        "prefix caching cuts that cost. Trainer resets the cache after every weight broadcast.",
+    )
+    parser.add_argument(
+        "--vllm.enable_chunked_prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="vLLM chunked prefill (default: vLLM auto — True for non-encoder-decoder models).",
+    )
+    parser.add_argument(
+        "--vllm.async_scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="vLLM async scheduling (default: vLLM auto — True for mp/uniproc executors with no spec-decode).",
+    )
+    parser.add_argument(
+        "--vllm.decode_context_parallel_size",
+        type=int,
+        default=1,
+        help="vLLM decode-context-parallel size; shards KV cache across decode workers for long contexts.",
+    )
+    # -- sampling & rollout batching --
+    parser.add_argument("--rollout.batch_size", type=int, default=1024, help="Batch size for make experience")
+    parser.add_argument(
+        "--rollout.vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
+    )
+    parser.add_argument("--rollout.micro_batch_size", type=int, default=1)
+    parser.add_argument(
+        "--rollout.max_new_tokens",
+        type=int,
+        default=None,
+        help="Max tokens to generate per sample. If None, dynamically computed as max_len - prompt_len per sample.",
+    )
+    parser.add_argument("--rollout.max_tokens_per_gpu", type=int, default=None)
+    parser.add_argument(
+        "--rollout.n_samples_per_prompt", type=int, default=1, help="number of responses for each prompt in generation"
+    )
+    parser.add_argument("--rollout.top_p", type=float, default=1.0)
+    parser.add_argument("--rollout.temperature", type=float, default=1.0)
+
+    # Training (loop hyperparameters; optimizer/scheduler/grad-clip are in the shared block above)
+    parser.add_argument("--train.batch_size", type=int, default=128, help="Global training batch size")
+    parser.add_argument("--train.micro_batch_size", type=int, default=1, help="batch size per GPU")
+    parser.add_argument("--train.max_tokens_per_gpu", type=int, default=16192)
+    parser.add_argument("--train.max_epochs", type=int, default=1)
+    parser.add_argument("--train.num_episodes", type=int, default=1)
+    parser.add_argument("--train.seed", type=int, default=42)
+    parser.add_argument(
+        "--train.full_determinism_enable",
+        action="store_true",
+        default=False,
+        help="Enable reproducible behavior during distributed training",
+    )
+    # Dynamic batch changes microbatch grouping; the packed representation
+    # still follows the loaded actor model path.
+    parser.add_argument(
+        "--train.dynamic_batch_enable",
+        action="store_true",
+        default=False,
+        help="Group packed samples by token budget; reuses the loaded model's packed forward path.",
+    )
+    parser.add_argument(
+        "--train.force_on_policy",
+        action="store_true",
+        default=False,
+        help=(
+            "Force true on-policy updates: accumulate gradients over the ENTIRE flattened rollout "
+            "batch and run a single optimizer step at the final microbatch, instead of splitting "
+            "the rollout into several train.batch_size / grad-accum windows. Needed for multi-turn "
+            "flatten, where the per-rollout sample count is variable and a fixed train.batch_size "
+            "would make every step after the first off-policy and drop the trailing samples. "
+            "Requires --train.max_epochs 1."
+        ),
+    )
+
+    # Distributed: Ray actor/ref placement + async pipelining (FSDP TP/CP/EP sizes are in the shared block above)
+    parser.add_argument("--actor.num_nodes", type=int, default=1, help="number of nodes for actor")
+    parser.add_argument("--actor.num_gpus_per_node", type=int, default=8, help="number of gpus per node for actor")
+    parser.add_argument("--ref.num_nodes", type=int, default=1, help="number of nodes for reference")
+    parser.add_argument("--ref.num_gpus_per_node", type=int, default=8, help="number of gpus per node for reference")
+    parser.add_argument(
+        "--train.colocate_fsdp_models",
+        action="store_true",
+        default=False,
+        help="Colocate the FSDP models (actor, reference, critic) on the actor's GPUs (they time-slice the same GPUs).",
+    )
+    parser.add_argument("--train.async_queue_size", type=int, default=1, help="Queue size for async sampler<->trainer")
+    parser.add_argument(
+        "--train.partial_rollout_enable",
+        action="store_true",
+        default=False,
+        help="Use vLLM pause/resume during weight sync so generation can overlap with training.",
+    )
+
+    # Eval
+    parser.add_argument("--eval.dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--eval.split", type=str, default="train")
+    parser.add_argument("--eval.steps", type=int, default=-1, help="Evaluate every N steps; -1 disables eval.")
+    parser.add_argument("--eval.temperature", type=float, default=0.6, help="Temperature for evaluation")
+    parser.add_argument(
+        "--eval.n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
+    )
+    parser.add_argument(
+        "--eval.eval_at_start",
+        action="store_true",
+        help="Run one baseline eval at global_step 0 (before any update) to measure the pre-RL model. "
+        "Fresh runs only — gated on the consumed-prompt counter being 0, so a resume (which loads a "
+        "non-zero step) does not add a redundant eval.",
+    )
+
+    # Runtime / misc
+    parser.add_argument("--local_rank", type=int, default=-1, help="local_rank from torchrun")
+    parser.add_argument("--use_ms", action="store_true", default=False, help="Resolve models from ModelScope hub.")
+
+    args = parser.parse_args()
+    from molt.utils.config import hierarchize
+
+    args = hierarchize(args)
+
+    # ============================ Validate / derive arguments ============================
+    # NOTE: ordering matters where a check derives state a later check reads — the
+    # on_policy_distill branch fills in agent_path / kl.* before they are validated,
+    # and the VLM branch flips fsdp.packing_samples before the FSDP checks read it.
+
+    # --- Required inputs ---
+    if not args.actor.model_name_or_path:
+        raise ValueError("--actor.model_name_or_path is required")
+
+    if not args.vllm.num_engines or args.vllm.num_engines <= 0:
+        raise NotImplementedError(
+            "RL rollout currently requires vLLM. Set --vllm.num_engines > 0; "
+            "actor-side generation fallback is not wired in this AutoModel path."
+        )
+
+    # --- Algorithm setup & defaults ---
+    if args.actor.eps_clip_low_high is None:
+        # Default to the standard symmetric PPO clip; every launch script passes
+        # --actor.eps_clip_low_high explicitly, so this is just the bare-CLI default.
+        args.actor.eps_clip_low_high = (0.2, 0.2)
+
+    if args.algo.advantage.estimator == "on_policy_distill":
+        # On-policy distillation is a single switch. The reference model IS the teacher and the
+        # per-token reverse KL to it is the whole training signal, so the rest is derived here —
+        # no flags needed beyond --ref.model_name_or_path (and optional --algo.kl.init_coef).
+        if not args.ref.model_name_or_path:
+            raise ValueError("on_policy_distill requires --ref.model_name_or_path (the teacher checkpoint).")
+        args.algo.kl.estimator = "k1"  # ctx.kls = log pi_student - log pi_teacher (the reverse-KL reward)
+        args.algo.kl.use_loss = False  # KL flows through the advantage, not a separate loss term
+        if args.algo.kl.init_coef is None:
+            args.algo.kl.init_coef = 1.0  # pull onto the teacher at unit scale
+        if not args.train.agent_path:
+            # Distillation needs no task agent — default to the built-in generator (which just
+            # samples one on-policy completion per prompt, VLM-aware). Override for multi-turn.
+            from molt.agents import distill_agent
+
+            args.train.agent_path = distill_agent.__file__
+
+    # Standard KL-to-init RL default (on_policy_distill set its own coefficient above).
+    if args.algo.kl.init_coef is None:
+        args.algo.kl.init_coef = 0.01
+
+    # --- Agent / rollout ---
+    if not args.train.agent_path:
+        raise ValueError("--train.agent_path is required for non-critic RL")
+
+    # Set vLLM generate_batch_size to rollout_batch_size if not specified
+    if not args.rollout.vllm_generate_batch_size:
+        args.rollout.vllm_generate_batch_size = args.rollout.batch_size
+
+    # --- Algorithm checks ---
+    if args.algo.advantage.estimator in ["rloo", "reinforce_baseline", "grpo", "dr_grpo"]:
+        assert (
+            args.rollout.n_samples_per_prompt > 1
+        ), f"{args.algo.advantage.estimator} requires n_samples_per_prompt > 1"
+
+    if args.algo.kl.use_loss and args.algo.kl.estimator not in ("k2", "k3"):
+        print(f"Recommend setting {args.algo.kl.estimator} to 'k2' or 'k3' when using KL as a loss")
+    elif not args.algo.kl.use_loss and args.algo.kl.estimator != "k1":
+        print(f"Recommend setting {args.algo.kl.estimator} to 'k1' when not using KL as a loss.")
+
+    if args.algo.dynamic_filtering_enable:
+        assert (
+            args.algo.dynamic_filtering_range[0] < args.algo.dynamic_filtering_range[1]
+        ), "dynamic_filtering_range[0] must be less than dynamic_filtering_range[1]"
+        assert args.train.agent_path, "--train.agent_path must be specified when using dynamic filtering"
+        assert (
+            args.rollout.n_samples_per_prompt > 1
+        ), "n_samples_per_prompt must be greater than 1 when using dynamic filtering"
+
+    if not args.algo.advantage.is_correction_enable:
+        print(
+            "[Warning] Async rollout samples may be off-policy. Enable "
+            "--algo.advantage.is_correction_enable to correct rollout logprobs during training."
+        )
+
+    # --- Data ---
+    if args.data.max_images_per_prompt > 0 and args.fsdp.packing_samples:
+        print("[Warning] VLM training does not support --fsdp.packing_samples; disabling packing for this run.")
+        args.fsdp.packing_samples = False
+
+    if args.data.input_template and "{}" not in args.data.input_template:
+        print("[Warning] '{}' not in args.data.input_template, set to None")
+        args.data.input_template = None
+
+    if args.data.input_template and "\\n" in args.data.input_template:
+        print(
+            "[Warning] input_template contains \\n characters instead of newline. "
+            "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
+        )
+
+    # --- Parallelism / FSDP ---
+    if args.fsdp.pp_size > 1:
+        raise NotImplementedError("Molt trainers are not pipeline-parallel aware yet; set --fsdp.pp_size 1")
+
+    if args.fsdp.cp_size > 1 and args.fsdp.packing_samples:
+        raise ValueError(
+            "RL with --fsdp.cp_size > 1 is incompatible with --fsdp.packing_samples; "
+            "the CP path is wired for padded batches and packed RL still needs CP-aware varlen boundaries."
+        )
+
+    if args.fsdp.packing_samples:
+        assert args.vllm.num_engines > 0, "Only support `--fsdp.packing_samples` with vLLM."
+        if args.fsdp.attn_implementation not in {"te", "flash_attention_2"}:
+            raise ValueError("--fsdp.packing_samples requires --fsdp.attn_implementation te or flash_attention_2.")
+
+    # --- Training / rollout sizing ---
+    if args.train.dynamic_batch_enable:
+        if not args.fsdp.packing_samples:
+            raise ValueError(
+                "--train.dynamic_batch_enable requires packed training batches; "
+                "pass --fsdp.packing_samples or disable dynamic batch."
+            )
+        if args.rollout.max_tokens_per_gpu is None:
+            print("[Warning] Set --rollout.max_tokens_per_gpu to --train.max_tokens_per_gpu.")
+            args.rollout.max_tokens_per_gpu = args.train.max_tokens_per_gpu
+
+    if args.train.force_on_policy and args.train.max_epochs != 1:
+        raise ValueError(
+            "--train.force_on_policy requires --train.max_epochs 1: max_epochs is the number of PPO "
+            "epochs over each rollout, and on-policy training must take exactly one pass — any epoch "
+            "after the first trains on data the (now updated) weights did not generate."
+        )
+
+    assert (
+        args.rollout.n_samples_per_prompt * args.rollout.batch_size // args.rollout.micro_batch_size
+        >= args.actor.num_nodes * args.actor.num_gpus_per_node // get_model_parallel_size(args)
+    ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
+
+    # --- Eval ---
+    if args.eval.dataset:
+        assert args.train.agent_path, "`--eval.dataset` requires `--train.agent_path`."
+
+    # --- Runtime ---
+    if args.use_ms:
+        from modelscope.utils.hf_util import patch_hub
+
+        # Patch hub to download models from modelscope to speed up.
+        patch_hub()
+
+    train(args)

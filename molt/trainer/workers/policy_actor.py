@@ -1,0 +1,808 @@
+import os
+import socket
+import time
+from contextlib import ExitStack
+from dataclasses import fields
+from typing import Dict, List, Optional, Union
+
+import ray
+import torch
+import torch.distributed
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from molt.models import Actor, PolicyLoss, agg_loss
+from molt.models.utils import compute_approx_kl, masked_mean, split_moe_aux_loss
+from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
+from molt.trainer.fsdp import FsdpStrategy
+from molt.trainer.fsdp.refit import (
+    gather_full_param,
+    should_refit_state_dict_entry,
+    state_dict_parameter_trainability,
+)
+from molt.utils import get_tokenizer
+from molt.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
+from molt.utils.logging_utils import init_logger
+from molt.utils.vlm_utils import merge_mm_train_inputs
+
+from ..algorithm import NaiveReplayBuffer
+from .actor_group import BaseModelActor
+
+logger = init_logger(__name__)
+
+
+class PolicyTrainer:
+    """Owns actor-side policy optimization on each Ray/FSDP worker."""
+
+    def __init__(
+        self,
+        strategy,
+        actor: Actor,
+        actor_optim: Optimizer,
+        actor_scheduler,
+        micro_train_batch_size: int = 8,
+        buffer_limit: int = 0,
+        buffer_cpu_offload: bool = True,
+        tokenizer=None,
+        dataloader_pin_memory: bool = True,
+        vllm_engines: List = None,
+        **kwargs,
+    ):
+        """Policy trainer for Ray actor workers.
+
+        Args:
+            vllm_engines (List, optional): vllm engines for text generation, if not specified, generate text by actor model directly. Defaults to None.
+        """
+        self.strategy = strategy
+        self.args = strategy.args
+        # MOLT_DEFER_GRAD_SYNC=1 → defer the FSDP grad reduce-scatter to the last
+        # microbatch of the accumulation window (AutoModel's get_sync_ctx /
+        # defer_fsdp_grad_sync default: ~1 reduce-scatter/step instead of one per
+        # microbatch). Mathematically identical (reduce-scatter is linear over the
+        # accumulated grad). Default ON to align with AutoModel's default; it trades
+        # comm for higher peak memory, so set =0 for memory-bound runs that OOM.
+        self._defer_grad_sync = os.environ.get("MOLT_DEFER_GRAD_SYNC", "1") == "1"
+        self.tokenizer = tokenizer
+        self.dataloader_pin_memory = dataloader_pin_memory
+
+        self.actor = actor
+        self.actor_optim = actor_optim
+        self.actor_scheduler = actor_scheduler
+        self.vllm_engines = vllm_engines
+        self.max_epochs = self.args.train.max_epochs
+
+        self.actor_loss_fn = PolicyLoss(
+            clip_eps_low=self.args.actor.eps_clip_low_high[0],
+            clip_eps_high=self.args.actor.eps_clip_low_high[1],
+            dual_clip=self.args.actor.dual_clip,
+            enable_vllm_is_correction=self.args.algo.advantage.is_correction_enable,
+            vllm_is_truncated_threshold=(
+                self.args.algo.advantage.is_correction_threshold
+                if self.args.algo.advantage.is_correction_enable
+                else None
+            ),
+            vllm_is_correction_type=self.args.algo.advantage.is_correction_type,
+        )
+
+        # Add the MoE router load-balancing aux loss only when its coefficient is set.
+        self.aux_loss = self.args.actor.aux_loss_coef > 1e-8
+
+        self.replay_buffer = NaiveReplayBuffer(
+            micro_train_batch_size,
+            buffer_limit,
+            buffer_cpu_offload,
+            dynamic_batch=self.args.train.dynamic_batch_enable,
+        )
+
+        # Init torch group for weights sync (NCCL only — async-split topology
+        # has actor and vLLM on different nodes, so CUDA IPC is not applicable).
+        backend = getattr(self.strategy.args.vllm, "sync_backend", "nccl")
+        if self.vllm_engines is not None and torch.distributed.get_rank() == 0:
+            self._init_vllm_sync_group(backend)
+
+        # AutoModel's MFU calculator (owns the per-arch FLOP model + device-peak
+        # table); None if AutoModel/arch unsupported -> we then report memory only.
+        self._mfu = None
+        try:
+            from nemo_automodel._transformers.mfu import AutoMFU
+
+            self._mfu = AutoMFU.from_config(self.actor.model, device=torch.cuda.get_device_name())
+        except Exception as exc:
+            logger.warning(f"perf: MFU unavailable ({exc!r}); reporting memory only.")
+
+        torch_dist_barrier_and_cuda_sync()
+
+    def _init_vllm_sync_group(self, backend: str):
+        """Create a torch process group between trainer rank 0 and all vLLM engine ranks.
+
+        Layout example (3 engines, TP=4):
+            [    0,      1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12]
+            |train rank|  engine-0  |  engine-1  |   engine-2   |
+
+        One rank per vLLM worker GPU, so an engine occupies
+        `tensor_parallel_size` consecutive ranks; a TP group spanning 2 nodes
+        still contributes one rank per GPU. The packed broadcast reaches every
+        worker; each loads only the shards/experts it owns. FSDP2/TP params are
+        materialized before broadcasting.
+        """
+        master_address = ray._private.services.get_node_ip_address()
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            master_port = sock.getsockname()[1]
+
+        vllm_num_engines = self.strategy.args.vllm.num_engines
+        vllm_tensor_parallel_size = self.strategy.args.vllm.tensor_parallel_size
+        world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
+
+        group_name = "molt"
+        refs = [
+            engine.init_process_group.remote(
+                master_address,
+                master_port,
+                i * vllm_tensor_parallel_size + 1,
+                world_size,
+                group_name,
+                backend=backend,
+            )
+            for i, engine in enumerate(self.vllm_engines)
+        ]
+        self._model_update_group = stateless_init_process_group(
+            master_address, master_port, 0, world_size, torch.cuda.current_device()
+        )
+
+        ray.get(refs)
+
+    def _record_status(self, status, status_list, pbar):
+        metrics = status["metrics"]
+        weights = status["weights"]
+        n_tokens = status["num_action_tokens"]
+        n_samples = status["num_samples"]
+
+        # Weighted mean of each metric across DP ranks: scale this rank's value by
+        # its local token/sample count, all-reduce the weighted sums together with
+        # the counts (carried as "_num_*" so they ride the same reduce), then divide
+        # by the reduced totals. weight is None means "report as-is" (e.g. lr) -> kept
+        # out of the reduce in last_metrics.
+        reduced_status = {"_num_action_tokens": n_tokens, "_num_samples": n_samples}
+        last_metrics = {}
+        for k, value in metrics.items():
+            weight = weights[k]
+            if weight is None:
+                last_metrics[k] = value
+                continue
+            scale = n_tokens if weight == "token" else n_samples
+            reduced_status[k] = (
+                value.float().mean().item() * scale if isinstance(value, torch.Tensor) else value * scale
+            )
+
+        reduced_status = self.strategy.all_reduce(reduced_status)
+
+        # n_tokens/n_samples above were this rank's local counts; these are the
+        # cross-rank totals that serve as the weighted-mean denominators.
+        total_tokens = reduced_status.pop("_num_action_tokens")
+        total_samples = reduced_status.pop("_num_samples")
+        merged_status = {}
+        for k, value in reduced_status.items():
+            denom = total_tokens if weights[k] == "token" else total_samples
+            merged_status[k] = value / denom
+
+        merged_status.update(last_metrics)
+        merged_status["_num_samples"] = total_samples
+        merged_status["_num_action_tokens"] = total_tokens
+        merged_status["_weights"] = weights
+
+        short_status = {
+            "act_loss": merged_status["policy_loss"],
+            "reward": merged_status.get("reward", 0),
+            "return": merged_status.get("return", 0),
+            "gen_len": merged_status.get("response_length", 0),
+            "tot_len": merged_status.get("total_length", 0),
+            "kl": merged_status.get("kl", 0),
+            "act_lr": merged_status.get("actor_lr", 0),
+            "grad_norm": merged_status.get("actor_grad_norm", 0),
+        }
+        if "entropy_loss" in merged_status:
+            short_status["ent_loss"] = merged_status["entropy_loss"]
+
+        status_list.append(merged_status)
+        pbar.set_postfix(short_status)
+
+    def policy_train(self, kl_ctl: float):
+        # replay buffer may be empty at first, we should rebuild at each training
+        if self.args.train.dynamic_batch_enable:
+            self.replay_buffer.setup_dynamic_batch(self.strategy)
+
+        should_shuffle = get_model_parallel_size(self.args) <= 1 and not self.args.train.dynamic_batch_enable
+        dataloader = DataLoader(
+            self.replay_buffer,
+            batch_size=self.replay_buffer.sample_batch_size,
+            shuffle=should_shuffle,
+            drop_last=True,
+            pin_memory=self.dataloader_pin_memory,
+            collate_fn=self.replay_buffer.collate_fn,
+        )
+        device = torch.cuda.current_device()
+
+        # Perf accounting: peak memory + FLOPs/MFU for this optimization phase.
+        torch.cuda.reset_peak_memory_stats(device)
+        perf_t0 = time.time()
+        local_seq_count = 0.0
+        local_token_sum = 0.0
+
+        status_list = []
+        status_mean = {}
+        for epoch in range(self.max_epochs):
+            pbar = tqdm(
+                dataloader,
+                desc=f"Train epoch [{epoch + 1}/{self.max_epochs}]",
+                disable=not self.strategy.is_rank_0(),
+            )
+            dynamic = self.args.train.dynamic_batch_enable
+            force_on_policy = self.args.train.force_on_policy
+            accum_steps = self.strategy.accumulated_gradient
+            max_steps = len(dataloader)
+            if force_on_policy and not dynamic:
+                # On-policy: the whole rollout is ONE accumulation window —
+                # accumulate every microbatch and step once at the end, so the
+                # update is computed from exactly the data the current weights
+                # generated. max_epochs is asserted == 1, so this is one step.
+                accum_steps = max(max_steps, 1)
+            elif not dynamic:
+                # Only run complete accumulation windows; partial windows leave
+                # gradients live because optimizer_step() has not stepped yet.
+                remainder = max_steps % accum_steps
+                if remainder:
+                    max_steps -= remainder
+                    self.strategy.print(
+                        f"[PolicyRL] dropping {remainder} trailing actor microbatches "
+                        f"(< grad_accum={accum_steps}) to avoid partial gradients."
+                    )
+            # slime global token-mean: every microbatch of one optimizer-step
+            # batch ("window") shares a single token denominator summed over all
+            # its microbatches and all DP ranks. Buffer the window, count its
+            # action tokens on the full pre-CP mask, then run its microbatches.
+            window = []
+            for step, experience in enumerate(pbar):
+                if step >= max_steps:
+                    break
+                window.append(experience)
+                if dynamic:
+                    window_end = bool(self.replay_buffer.dynamic_optimizer_step[step])
+                else:
+                    window_end = len(window) == accum_steps
+                if not window_end:
+                    continue
+                local_tokens = sum(exp.action_mask.sum() for exp in window)
+                batch_num_tokens = self.strategy.global_token_count(local_tokens)
+                for idx, exp in enumerate(window):
+                    exp.to_device(device)
+                    # Full per-sequence lengths drive the FLOP estimate (forward
+                    # processes the whole sequence, not just action tokens).
+                    seqlens = exp.attention_mask.sum(dim=-1)
+                    local_seq_count += float(seqlens.numel())
+                    local_token_sum += float(seqlens.sum())
+                    is_optimizer_step = idx == len(window) - 1
+                    status = self.training_step(exp, kl_ctl, batch_num_tokens, len(window), is_optimizer_step)
+                    self._record_status(status, status_list, pbar)
+                    if force_on_policy and self.replay_buffer.cpu_offload:
+                        # The window spans the whole rollout; offload each
+                        # microbatch back to CPU after use so peak GPU holds one
+                        # microbatch, not the entire buffer (matters for VLM).
+                        exp.to_device(torch.device("cpu"))
+                window = []
+            assert not window, "actor train window not flushed at epoch end"
+
+        if status_list:
+            total_tokens = sum(s["_num_action_tokens"] for s in status_list)
+            total_samples = sum(s["_num_samples"] for s in status_list)
+            for k in set().union(*(s.keys() for s in status_list)):
+                if k in ("_num_samples", "_num_action_tokens", "_weights"):
+                    continue
+                if k == "actor_grad_norm":
+                    vals = [s[k] for s in status_list if k in s]
+                    status_mean[k] = sum(vals) / len(vals) if vals else 0.0
+                elif k == "actor_lr":
+                    vals = [s[k] for s in status_list if k in s]
+                    status_mean[k] = vals[-1] if vals else 0.0
+                elif status_list[0].get("_weights", {}).get(k) == "token":
+                    status_mean[k] = sum(s.get(k, 0) * s["_num_action_tokens"] for s in status_list) / total_tokens
+                else:
+                    status_mean[k] = sum(s.get(k, 0) * s["_num_samples"] for s in status_list) / total_samples
+
+        status_mean.update(
+            self.strategy.compute_perf_metrics(self._mfu, local_seq_count, local_token_sum, time.time() - perf_t0)
+        )
+        return status_mean
+
+    def training_step(
+        self,
+        experience: Experience,
+        kl_ctl: float,
+        batch_num_tokens: torch.Tensor,
+        num_microbatches: int,
+        is_optimizer_step: bool,
+    ) -> Dict[str, object]:
+        self.actor.train()
+
+        sequences = experience.sequences
+        action_mask = experience.action_mask
+        attention_mask = experience.attention_mask
+        old_action_log_probs = experience.action_log_probs
+        advantages = experience.advantages
+        base_action_log_probs = experience.base_action_log_probs
+        rollout_log_probs = experience.rollout_log_probs
+
+        # Stage 1: prepare tensors and optional multimodal inputs.
+        multimodal_inputs = {}
+        if (
+            hasattr(experience, "mm_train_inputs")
+            and experience.mm_train_inputs
+            and getattr(self.actor, "is_vlm", False)
+        ):
+            multimodal_inputs = merge_mm_train_inputs(experience.mm_train_inputs, sequences.device)
+
+        # AutoModel CP train context must cover both forward and backward.
+        cp_context_stack = ExitStack()
+
+        # Stage 2: forward actor. CP is only an implementation detail here:
+        # log-probs are restored to the dense token axis before losses run.
+        # The loss uses slime's global token-mean: batch_num_tokens is the action
+        # token count of the whole optimizer-step batch (all microbatches, all DP
+        # ranks), so FSDP's dp_cp reduce-scatter cannot bias gradients toward DP
+        # shards with fewer action tokens. The dp_size scale stays DP-only (CP
+        # ranks share the sample); the CP gradient compensation for FSDP's extra
+        # dp_cp averaging is applied in FsdpStrategy.backward (loss *= cp_size).
+        loss_data_parallel_size = self.strategy.dp_size
+        model_output = self.actor(
+            sequences,
+            action_mask,
+            attention_mask=attention_mask,
+            cp_context_stack=cp_context_stack,
+            # entropy_coef=0.0 disables the entropy term in loss. Skip the
+            # entropy forward path entirely in that case.
+            return_entropy=bool(self.args.actor.entropy_coef),
+            **multimodal_inputs,
+        )
+        action_log_probs = model_output["action_log_probs"]
+
+        # Stage 3: compute policy loss and metric-only policy diagnostics.
+        # reported_actor_loss is a plain per-token mean for logging, decoupled
+        # from the global token-mean used for the gradient (actor_loss).
+        actor_loss, reported_actor_loss, clip_ratio, policy_kl, vllm_kl, is_filter_ratio = self.actor_loss_fn(
+            action_log_probs,
+            old_action_log_probs,
+            advantages,
+            action_mask=action_mask,
+            rollout_log_probs=rollout_log_probs,
+            dp_size=loss_data_parallel_size,
+            batch_num_tokens=batch_num_tokens,
+        )
+        experience.info["policy_clip_ratio"] = clip_ratio.detach()
+        experience.info["policy_kl"] = policy_kl.detach()
+        if vllm_kl is not None:
+            experience.info["vllm_kl"] = vllm_kl.detach()
+        if is_filter_ratio is not None:
+            experience.info["is_filter_ratio"] = is_filter_ratio.detach()
+
+        # Stage 4: add optional KL-as-loss, MoE aux loss, and entropy regularization.
+        if self.args.algo.kl.use_loss:
+            if self.args.algo.kl.init_coef > 0:
+                approx_kl = compute_approx_kl(
+                    action_log_probs,
+                    base_action_log_probs,
+                    kl_estimator=self.args.algo.kl.estimator,
+                )
+                logprob_diff = torch.nan_to_num(
+                    action_log_probs.float() - base_action_log_probs.float(),
+                    nan=0.0,
+                    posinf=30.0,
+                    neginf=-30.0,
+                )
+            else:
+                approx_kl = torch.zeros_like(action_log_probs)
+                logprob_diff = torch.zeros_like(action_log_probs)
+            kl_loss = agg_loss(
+                approx_kl,
+                action_mask,
+                "token-mean",
+                dp_size=loss_data_parallel_size,
+                batch_num_tokens=batch_num_tokens,
+            )
+            mean_logprob_diff = masked_mean(logprob_diff, action_mask)
+            # Report a plain per-token mean (kl_loss itself is global-token-mean
+            # normalized for the gradient, i.e. a fraction-of-window, not a mean).
+            experience.info["kl"] = masked_mean(approx_kl, action_mask).detach()
+            experience.info["logprobs_diff"] = mean_logprob_diff.detach()
+        else:
+            kl_loss = 0
+
+        total_loss = actor_loss + kl_loss * kl_ctl
+        # MoE balancing loss. It is a per-microbatch mean, so divide by the
+        # window's microbatch count to average it over the optimizer-step batch
+        # (the token-level terms above are already whole-batch normalized).
+        if self.aux_loss:
+            aux_loss, _ = split_moe_aux_loss(model_output, self.aux_loss)
+            total_loss += aux_loss * self.args.actor.aux_loss_coef / num_microbatches
+        # entropy loss — only computed when entropy is actually wanted; matches
+        # the return_entropy gating on the forward call above. With coef=0/None,
+        # model_output.entropy was never materialized. entropy_loss is the plain
+        # per-token mean reported in metrics; the gradient term uses the same
+        # global token-mean as the policy loss.
+        if bool(self.args.actor.entropy_coef):
+            entropy = model_output.entropy[:, -experience.action_mask.shape[1] :]
+            entropy_loss = masked_mean(entropy, action_mask)
+            entropy_term = agg_loss(
+                entropy,
+                action_mask,
+                "token-mean",
+                dp_size=loss_data_parallel_size,
+                batch_num_tokens=batch_num_tokens,
+            )
+            total_loss -= entropy_term * self.args.actor.entropy_coef
+        else:
+            entropy_loss = None
+
+        # Stage 5: backward and optimizer step. The global token denominator
+        # already normalizes over the whole optimizer-step batch, so the loss
+        # must NOT be re-divided by the accumulation count (scale_loss_by_
+        # accumulation=False) — same contract as the SFT trainer.
+        try:
+            self.strategy.backward(
+                total_loss,
+                self.actor,
+                self.actor_optim,
+                name="actor",
+                accumulate=not self.args.train.dynamic_batch_enable,
+                scale_loss_by_accumulation=False,
+                # Defer the grad reduce-scatter to the optimizer-step microbatch when
+                # enabled; otherwise sync every microbatch (default). See _defer_grad_sync.
+                sync_gradients=(is_optimizer_step if self._defer_grad_sync else True),
+            )
+        finally:
+            cp_context_stack.close()
+
+        # The window loop owns the optimizer-step boundary (is_optimizer_step) for
+        # every batching mode — grad-accum, dynamic token-budget, and
+        # force-on-policy alike. Accumulate until then; step on the final
+        # microbatch, where .grad is the fully reduced batch gradient.
+        if is_optimizer_step:
+            self.strategy.optimizer_step(
+                self.actor_optim, self.actor, self.actor_scheduler, name="actor", accumulate=False
+            )
+
+        # Stage 6: collect weighted metrics from this microbatch.
+        metrics = {"policy_loss": reported_actor_loss.detach()}
+        weights = {"policy_loss": "token"}
+        if entropy_loss is not None:
+            metrics["entropy_loss"] = entropy_loss.detach()
+            weights["entropy_loss"] = "token"
+
+        metrics["actor_lr"] = self.actor_scheduler.get_last_lr()[0]
+        weights["actor_lr"] = None
+        # grad_norm is meaningful only on the optimizer-step microbatch, where
+        # .grad is the fully reduced batch gradient.
+        if is_optimizer_step:
+            # True clip-time norm of the accumulated gradient. Normalization now
+            # comes from the global token denominator (whole optimizer-step
+            # batch), not a /accum factor, so after accumulation .grad is already
+            # the correctly normalized batch gradient. This matches the value
+            # clipped against max_norm and the grad_norm convention on wandb.
+            metrics["actor_grad_norm"] = self.strategy.get_grad_norm(self.actor)
+            weights["actor_grad_norm"] = None
+
+        for k, v in experience.info.items():
+            if isinstance(v, torch.Tensor):
+                metrics[k] = v
+                weights[k] = "token" if v.dim() == 0 else "sample"
+            elif isinstance(v, list):
+                metrics[k] = torch.tensor(v, dtype=torch.float)
+                weights[k] = "sample"
+
+        for f in fields(Experience):
+            if f.name in {"rewards", "scores"} or not Experience.is_episode_tensor_field(f.name):
+                continue
+            value = getattr(experience, f.name)
+            if isinstance(value, torch.Tensor) and f.name not in metrics:
+                metrics[f.name] = value
+                weights[f.name] = "sample"
+
+        return {
+            "metrics": metrics,
+            "weights": weights,
+            "num_samples": float(experience.action_mask.shape[0]),
+            "num_action_tokens": float(action_mask.sum().item()),
+        }
+
+    def broadcast_to_vllm(self):
+        torch.cuda.empty_cache()
+        # FSDP2/AutoModel: `actor.model` is the FSDP2-wrapped HF model directly
+        # (no DS-engine `.module` indirection); params are DTensors when sharded.
+        model = self.actor.model
+
+        from torch.distributed.tensor import DTensor
+
+        from molt.utils.utils import convert_to_torch_dtype
+
+        sync_dtype = convert_to_torch_dtype(self.strategy.args.fsdp.param_dtype)
+        ep_size = getattr(self.strategy.args.fsdp, "ep_size", 1) or 1
+        parameter_trainability = state_dict_parameter_trainability(model)
+
+        # Pack many small per-tensor broadcasts into ~1 GiB batched broadcasts.
+        # Inspired by vLLM's `vllm.distributed.weight_transfer.packed_tensor`
+        # — same idea, simplified (no double-buffer streams) since FSDP
+        # `gather_full_param` already serializes on the default stream so
+        # overlap gain is small. Cuts a 30B+ MoE refit from thousands of
+        # RPC+broadcast pairs to ~tens.
+        #
+        # Only trainer rank 0 holds `_model_update_group`; non-rank-0 ranks
+        # still call `gather_full_param` (an FSDP collective) but drop the
+        # gathered tensor immediately — no point staging ~1 GiB on every rank.
+        is_rank0 = torch.distributed.get_rank() == 0
+        packed_threshold_bytes = 1 << 30  # 1 GiB
+
+        pending_metas: list[tuple[str, torch.dtype, tuple[int, ...]]] = []
+        pending_tensors: list[torch.Tensor] = []
+        pending_bytes = 0
+
+        def _flush():
+            nonlocal pending_bytes
+            if not pending_metas:
+                return
+            refs = [engine.update_weights_packed.remote(pending_metas) for engine in self.vllm_engines]
+            flat = torch.cat([t.view(torch.uint8).view(-1) for t in pending_tensors], dim=0)
+            self._model_update_group.broadcast(flat, src=0, stream=torch.cuda.current_stream())
+            ray.get(refs)
+            del flat
+            pending_metas.clear()
+            pending_tensors.clear()
+            pending_bytes = 0
+
+        for name, tensor in model.state_dict().items():
+            if not should_refit_state_dict_entry(
+                name,
+                tensor,
+                parameter_trainability,
+                is_vlm=getattr(self.actor, "is_vlm", False),
+            ):
+                continue
+
+            # EP-sharded experts must be DTensors so `gather_full_param`'s
+            # `full_tensor()` collects every expert across the EP mesh. The
+            # default torch_mm experts (GroupedExperts + ExpertParallel) are
+            # DTensors, so this holds; but the TE GroupedLinear layout
+            # (BackendConfig experts="te") keeps only this rank's local experts
+            # as plain tensors, which would silently broadcast just rank-0's
+            # slice. nemo-rl relies on the same DTensor invariant — enforce it
+            # loudly rather than diverge train/rollout policies.
+            if ep_size > 1 and "expert" in name and not isinstance(tensor, DTensor):
+                raise RuntimeError(
+                    f"Refit: expert weight {name!r} is not a DTensor under ep_size={ep_size}; "
+                    "EP-sharded experts would not be gathered (only rank-0's experts reach "
+                    "vLLM). Build the MoE with BackendConfig experts='torch_mm' (the default)."
+                )
+
+            # Collective; every rank participates.
+            weight, _ = gather_full_param(tensor)
+            if not is_rank0:
+                del weight
+                continue
+            adapter = getattr(model, "state_dict_adapter", None)
+            if adapter is None:
+                hf_pairs = [(name, weight)]
+            elif getattr(adapter, "convert_single_tensor_to_hf", None) is not None:
+                hf_pairs = adapter.convert_single_tensor_to_hf(
+                    name, weight, exclude_key_regex=r".*_extra_state.*", quantization=False
+                )
+            elif getattr(adapter, "to_hf", None) is not None:
+                hf_pairs = list(adapter.to_hf({name: weight}, exclude_key_regex=r".*_extra_state.*").items())
+            else:
+                raise RuntimeError(
+                    f"{type(model).__name__} uses an AutoModel state_dict_adapter without "
+                    "`convert_single_tensor_to_hf`; vLLM refit cannot safely map this custom "
+                    "weight layout to HuggingFace/vLLM names."
+                )
+            for hf_name, hf_weight in hf_pairs:
+                if not torch.is_tensor(hf_weight) or not hf_weight.is_floating_point():
+                    continue
+                hf_weight = hf_weight.to(
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                    dtype=sync_dtype,
+                    non_blocking=True,
+                ).contiguous()
+                pending_metas.append((hf_name, sync_dtype, tuple(hf_weight.shape)))
+                pending_tensors.append(hf_weight)
+                pending_bytes += hf_weight.numel() * hf_weight.element_size()
+                if pending_bytes >= packed_threshold_bytes:
+                    _flush()
+            del weight
+
+        if is_rank0:
+            _flush()
+
+        torch.cuda.empty_cache()
+        torch_dist_barrier_and_cuda_sync()
+
+
+@ray.remote(num_gpus=1)
+class PolicyModelActor(BaseModelActor):
+    def init_model_from_pretrained(self, strategy: FsdpStrategy, pretrain, max_steps=None, vllm_engines=None):
+        args = strategy.args
+        self.save_hf_ckpt = args.ckpt.save_hf
+        self.vllm_engines = vllm_engines
+        self.max_steps = max_steps
+
+        # Only set NCCL_CUMEM_ENABLE=0 on vLLM < 0.16; on >= 0.16 it causes
+        # ncclCommInitRank to fail ("unhandled cuda error") under NCCL 2.27+.
+        if getattr(args.vllm, "sync_backend", "nccl") == "nccl":
+            import vllm
+            from packaging import version as pkg_version
+
+            if pkg_version.parse(vllm.__version__) < pkg_version.parse("0.16"):
+                os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
+        self._setup_distributed(strategy)
+
+        actor = Actor(
+            pretrain,
+            attn_implementation=strategy.args.fsdp.attn_implementation,
+            param_dtype=strategy.args.fsdp.param_dtype,
+            device_mesh=strategy.device_mesh,
+            moe_mesh=strategy.moe_mesh,
+            distributed_config=strategy.distributed_config,
+            moe_config=strategy.moe_config,
+            activation_checkpointing=args.actor.gradient_checkpoint,
+            packing_samples=strategy.args.fsdp.packing_samples,
+            temperature=strategy.args.rollout.temperature,
+            freeze_visual_encoder=getattr(strategy.args.actor, "freeze_visual_encoder", False),
+            moe_aux_loss_coef=args.actor.aux_loss_coef,
+        )
+        if vllm_engines is not None:
+            adapter = getattr(actor.model, "state_dict_adapter", None)
+            if (
+                adapter is not None
+                and getattr(adapter, "convert_single_tensor_to_hf", None) is None
+                and getattr(adapter, "to_hf", None) is None
+            ):
+                raise RuntimeError(
+                    f"{type(actor.model).__name__} uses an AutoModel state_dict_adapter without "
+                    "`convert_single_tensor_to_hf`; vLLM refit cannot safely map this custom "
+                    "weight layout to HuggingFace/vLLM names."
+                )
+        strategy.print(actor)
+
+        # configure tokenizer
+        self.tokenizer = get_tokenizer(
+            pretrain, actor.model, "left", use_fast=not strategy.args.data.disable_fast_tokenizer
+        )
+
+        actor_cfg = dict(
+            optim=args.actor.optim,
+            muon=vars(args.actor.muon),
+            adam=vars(args.actor.adam),
+            lr_scheduler=args.actor.lr_scheduler,
+            lr_warmup_ratio=args.actor.lr_warmup_ratio,
+            min_lr_ratio=args.actor.min_lr_ratio,
+            max_norm=args.actor.max_norm,
+            scheduler_steps=max_steps,
+        )
+        self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare((actor, actor_cfg))
+
+        # load checkpoint
+        self.checkpoint_states = {}
+        ckpt_path = os.path.join(args.ckpt.path, "_actor")
+        if args.ckpt.load_enable and os.path.exists(ckpt_path):
+            strategy.print(f"Loading the checkpoint: {ckpt_path}")
+            # LOAD_MODEL_ONLY=1: skip optim/scheduler state to allow switching optimizer kinds
+            # (e.g. Adam ckpt → Muon resume). LambdaLR's strict-zip on get_lr breaks when
+            # base_lrs (loaded, 1 entry for Adam) mismatches lr_lambdas (fresh, 4 entries for Muon).
+            model_only = os.environ.get("LOAD_MODEL_ONLY", "0") == "1"
+            _, states = strategy.load_ckpt(
+                self.actor.model,
+                ckpt_path,
+                optimizer=None if model_only else self.actor_optim,
+                scheduler=None if model_only else self.actor_scheduler,
+            )
+            self.checkpoint_states = states
+
+        # configure Trainer
+        self.trainer = PolicyTrainer(
+            strategy,
+            self.actor,
+            actor_optim=self.actor_optim,
+            actor_scheduler=self.actor_scheduler,
+            micro_train_batch_size=args.train.micro_batch_size,
+            tokenizer=self.tokenizer,
+            vllm_engines=self.vllm_engines,
+        )
+
+    def fit(self, kl_ctl: float = 0, train: bool = True):
+        """Train actor model with the replay buffer.
+
+        ``train=False`` (critic warmup / actor freeze) skips the policy update but
+        still drains the replay buffer, so it does not accumulate across the frozen
+        steps while the critic keeps training on the same rollouts.
+        """
+        torch.cuda.empty_cache()
+        status = {}
+        if train:
+            self.actor.train()
+            status = self.trainer.policy_train(kl_ctl)
+        self.trainer.replay_buffer.clear()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return status
+
+    def export_hf_model(self):
+        """Export HF safetensors snapshot to ckpt.output_dir.
+
+        This is NOT a resumable checkpoint — for that, see ``save_checkpoint``
+        (DCP rolling save). Called once at end of training to produce a
+        deployable HF model directory.
+        """
+        args = self.strategy.args
+
+        self.strategy.save_model(
+            self.actor,
+            self.tokenizer,
+            args.ckpt.output_dir,
+        )
+
+    def forward(
+        self,
+        sequences: torch.LongTensor,
+        action_mask: Optional[Union[int, list[int]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        mm_train_inputs_list=None,
+    ) -> torch.Tensor:
+        """Generate actor action log probabilities."""
+        device = torch.cuda.current_device()
+
+        # VLM: merge pre-processed multimodal inputs from all samples in batch
+        mm_inputs = {}
+        if mm_train_inputs_list and getattr(self.actor, "is_vlm", False):
+            mm_inputs = merge_mm_train_inputs(mm_train_inputs_list, device)
+
+        self.actor.eval()
+        with torch.no_grad():
+            output = self.actor(
+                sequences.to(device),
+                action_mask.to(device),
+                attention_mask.to(device),
+                **mm_inputs,
+            )
+        self.actor.train()  # reset model state
+        return output["action_log_probs"].to("cpu")
+
+    def broadcast_to_vllm(self):
+        self.trainer.broadcast_to_vllm()
+
+    def get_checkpoint_states(self):
+        return self.checkpoint_states
+
+    def append(self, experience: Experience):
+        self.trainer.replay_buffer.append(experience)
+
+    def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
+        args = self.strategy.args
+        client_states = client_states or {}
+        self.strategy.save_ckpt(
+            self.actor.model,
+            os.path.join(args.ckpt.path, "_actor"),
+            tag,
+            args.ckpt.max_num,
+            args.ckpt.max_mem,
+            client_states,
+            metric_value=metric_value,
+            metric_key=metric_key,
+            optimizer=self.actor_optim,
+            scheduler=self.actor_scheduler,
+        )
+        if self.save_hf_ckpt:
+            save_path = os.path.join(args.ckpt.path, f"{tag}_hf")
+            self.strategy.save_model(
+                self.actor,
+                self.tokenizer,
+                save_path,
+            )
+        torch_dist_barrier_and_cuda_sync()
