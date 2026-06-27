@@ -26,8 +26,10 @@ def test_state_dict_trainability_preserves_tied_parameter_aliases():
     )
 
 
-def test_refit_filter_keeps_narrow_moe_router_buffers_only():
+def test_refit_filter_skips_non_parameter_buffers():
     trainability = {}
 
-    assert should_refit_state_dict_entry("layers.0.mlp.expert_bias", torch.zeros(2), trainability, is_vlm=False)
+    assert not should_refit_state_dict_entry(
+        "layers.0.mlp.gate.e_score_correction_bias", torch.zeros(2), trainability, is_vlm=False
+    )
     assert not should_refit_state_dict_entry("some_metadata", torch.zeros(2), trainability, is_vlm=False)

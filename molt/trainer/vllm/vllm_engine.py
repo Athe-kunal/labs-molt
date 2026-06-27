@@ -252,11 +252,13 @@ class RolloutRayActor:
         # this call.
         start_version = self._weight_version
         off_policy_len = 0
+        prev_token_count = 0
         final_output = None
         async for request_output in generator:
             if self._weight_version != start_version:
-                off_policy_len = len(request_output.outputs[0].token_ids)
+                off_policy_len = prev_token_count
                 start_version = self._weight_version
+            prev_token_count = len(request_output.outputs[0].token_ids)
             final_output = request_output
 
         return final_output, off_policy_len

@@ -116,6 +116,13 @@ def _generate_responses_fn():
     return cls.generate_responses
 
 
+def _generate_fn():
+    actor = vllm_engine.RolloutRayActor
+    meta = getattr(actor, "__ray_metadata__", None)
+    cls = meta.modified_class if meta is not None else actor
+    return cls.generate
+
+
 class _Traj:
     """Minimal trajectory stub: group_id/rollout_id are assigned by the method."""
 
@@ -173,3 +180,28 @@ def test_generate_responses_shares_rollout_id_across_multiturn_steps():
     assert len(out) == 4  # 2 rollouts x 2 steps
     assert len({t.group_id for t in out}) == 1
     assert len({t.rollout_id for t in out}) == 2  # shared within a rollout, distinct across
+
+
+def test_generate_marks_only_tokens_before_weight_change_off_policy():
+    owner = SimpleNamespace(
+        _weight_version=0,
+        _mm_pad_token_ids=None,
+        _mm_image_placeholder_id=None,
+        _mm_image_start_ids=None,
+    )
+
+    class _LLM:
+        def generate(self, *args, **kwargs):
+            async def stream():
+                yield SimpleNamespace(outputs=[SimpleNamespace(token_ids=[10, 11])])
+                owner._weight_version = 1
+                yield SimpleNamespace(outputs=[SimpleNamespace(token_ids=[10, 11, 12])])
+                yield SimpleNamespace(outputs=[SimpleNamespace(token_ids=[10, 11, 12, 13])])
+
+            return stream()
+
+    owner.llm = _LLM()
+    final, off_policy_len = asyncio.run(_generate_fn()(owner, [1], SimpleNamespace()))
+
+    assert final.outputs[0].token_ids == [10, 11, 12, 13]
+    assert off_policy_len == 2
