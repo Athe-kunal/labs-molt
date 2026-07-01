@@ -250,6 +250,7 @@ class CriticModelActor(BaseModelActor):
             packing_samples=args.fsdp.packing_samples,
             temperature=args.rollout.temperature,
             freeze_visual_encoder=getattr(args.actor, "freeze_visual_encoder", False),
+            freeze_moe_router=getattr(args.actor, "freeze_moe_router", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
         )
         strategy.print(critic)

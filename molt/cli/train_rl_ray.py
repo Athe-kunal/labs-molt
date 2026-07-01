@@ -236,6 +236,13 @@ if __name__ == "__main__":
         help="Freeze vision encoder weights (only train language model). Reduces memory and weight sync overhead.",
     )
     parser.add_argument(
+        "--actor.freeze_moe_router",
+        action="store_true",
+        default=False,
+        help="Freeze the MoE router/gate weights so routing is held fixed during training, which "
+        "stabilizes MoE training and keeps the vLLM-vs-actor routing identical.",
+    )
+    parser.add_argument(
         "--ref.model_name_or_path",
         type=str,
         default=None,

@@ -236,6 +236,7 @@ class BaseModel(nn.Module):
         packing_samples: bool = False,
         temperature: float = 1.0,
         freeze_visual_encoder: bool = False,
+        freeze_moe_router: bool = False,
         use_fp32_master_weights: bool = True,
         moe_aux_loss_coef: float = 0.0,
         **kwargs,
@@ -461,6 +462,28 @@ class BaseModel(nn.Module):
             for name, param in self.model.named_parameters():
                 if "language_model" not in name and "lm_head" not in name:
                     param.requires_grad = False
+
+        # Optionally freeze the MoE router/gate so its weights stay fixed during training, which
+        # stabilizes MoE training and keeps the vLLM-vs-actor routing identical. Match by
+        # isinstance(Gate), NOT by name: the router linear is `Gate.weight` but its path varies by
+        # arch (omni3/NemotronV3 nests it under `mixer.gate`, other MoE families under `mlp.gate`)
+        # and a `gate` name match would also catch the gated-MLP `gate_proj.weight`, which is NOT a
+        # router. requires_grad=False excludes it from the optimizer and (for VLMs) the refit, so
+        # the router stays fixed on both the actor and vLLM.
+        if freeze_moe_router:
+            try:
+                from nemo_automodel.components.moe.layers import Gate
+            except ImportError:
+                Gate = None
+            n_frozen = 0
+            if Gate is not None:
+                for module in self.model.modules():
+                    if isinstance(module, Gate):
+                        for param in module.parameters(recurse=False):
+                            param.requires_grad = False
+                            n_frozen += 1
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print(f"[MoE] freeze_moe_router=True: froze {n_frozen} router param tensors")
 
         # https://github.com/huggingface/transformers/issues/26877
         # Use `model.generate(use_cache=True)` instead.

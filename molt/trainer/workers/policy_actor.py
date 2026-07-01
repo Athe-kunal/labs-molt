@@ -660,6 +660,7 @@ class PolicyModelActor(BaseModelActor):
             packing_samples=strategy.args.fsdp.packing_samples,
             temperature=strategy.args.rollout.temperature,
             freeze_visual_encoder=getattr(strategy.args.actor, "freeze_visual_encoder", False),
+            freeze_moe_router=getattr(strategy.args.actor, "freeze_moe_router", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
         )
         if vllm_engines is not None:
