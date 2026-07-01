@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from molt.trainer.fsdp.packing import (
     cp_dtensor_full_sequence,
+    cp_local_seq_index,
     is_automodel_custom_model,
     pack_padded_batch,
     pad_to_cp_multiple,
@@ -239,6 +240,7 @@ class BaseModel(nn.Module):
         freeze_moe_router: bool = False,
         use_fp32_master_weights: bool = True,
         moe_aux_loss_coef: float = 0.0,
+        routing_replay: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -436,6 +438,36 @@ class BaseModel(nn.Module):
         # the loaded class so the forward path picks the right pack style.
         self._packing_style = "automodel" if is_automodel_custom_model(self.model) else "hf"
         configure_nemo_moe_aux_loss(self.model, moe_aux_loss_coef)
+        if routing_replay:
+            # R3: give every MoE gate a RouterReplay handle so the training forward
+            # can replay the rollout's expert selection. Done post from_pretrained
+            # (not via MoEConfig) so it stays model-agnostic.
+            #
+            # vLLM captures routing into a [num_hidden_layers, topk] buffer indexed by
+            # the GLOBAL decoder-layer id (non-MoE rows stay zero). For a hybrid model
+            # (omni3: Mamba/attention/MoE interleaved) the MoE gates sit at sparse
+            # global layer ids, so each gate must replay against its own global-id row
+            # -- not the i-th row. We read that id from the module path (`...layers.7...`);
+            # uniform-MoE models (qwen3.6) parse to 0..N-1, so selection is a no-op there.
+            import re
+
+            from nemo_automodel.components.moe.router_replay import RouterReplay
+
+            RouterReplay.clear_registry()
+            gate_layer_ids: list[int] = []
+            for name, module in self.model.named_modules():
+                if hasattr(module, "router_replay"):  # an AutoModel MoE gate
+                    module.router_replay = RouterReplay()
+                    m = re.search(r"layers\.(\d+)\b", name)
+                    gate_layer_ids.append(int(m.group(1)) if m else len(gate_layer_ids))
+            if not gate_layer_ids:
+                raise RuntimeError("routing_replay is on but the model has no MoE router gates.")
+            self._num_routing_gates = len(gate_layer_ids)
+            self._moe_layer_global_ids = gate_layer_ids
+            print(
+                f"[R3] Routing replay enabled on {len(gate_layer_ids)} MoE gates "
+                f"at global layer ids {gate_layer_ids}."
+            )
         if self.packing_samples:
             print("[Packing] Using AutoModel THD/TE packed path.")
 
@@ -515,6 +547,48 @@ class BaseModel(nn.Module):
             t = unpack_to_padded(t, indices, batch, seqlen)
         return t
 
+    def _build_routing_targets(self, routed_experts, indices, cp_forward):
+        """Shard the R3 routing ids to this rank's forward token order (RouterReplay).
+
+        ``routed_experts`` is ``(B, vllm_layers, topk, S)`` — the rollout router's
+        top-k expert ids per token, seq last. Returns one ``(num_tokens, topk)`` long
+        tensor per MoE gate (layer order), reordered to exactly what the gate sees on
+        this rank: CP load-balanced under cp>1, packed (pad removed) under sample
+        packing, or the plain padded ``B*S`` order otherwise.
+
+        Positions with no captured rollout routing (a multimodal prompt the engine did
+        not route, feedback, CP pad) carry a -1 sentinel; ``RouterReplay`` keeps the
+        live (natural) selection there and replays only the captured rows.
+
+        vLLM sizes the layer dim to num_hidden_layers and indexes it by the GLOBAL
+        decoder-layer id (omni3: 52 rows, MoE gates sparse among them; non-MoE rows
+        are zero). So we pick each gate's own global-id row (``_moe_layer_global_ids``,
+        set at attach time) rather than the first ``n_gates`` rows. For a uniform-MoE
+        model (qwen3.6) the ids are 0..N-1, so this reduces to the plain layer order.
+        """
+        n_gates = self._num_routing_gates
+        global_ids = self._moe_layer_global_ids
+        routing = routed_experts  # (B, vllm_layers, topk, S), seq last
+        if cp_forward:
+            # Take this rank's CP shard. Pad the seq dim as the forward did — with the -1
+            # "keep live routing" sentinel, so CP pad tokens aren't force-routed to expert
+            # 0 — then gather the head+tail chunks this rank holds. Local length is the
+            # padded length / cp_size, derived from `routing` here (NOT the post-shard len).
+            routing = pad_to_cp_multiple(routing, self.cp_size, seq_dim=3, value=-1)
+            local_positions = cp_local_seq_index(routing.shape[3] // self.cp_size, self.cp_mesh, routing.device)
+            routing = routing.index_select(3, local_positions)
+        b, n_layers, topk, s = routing.shape
+        if n_layers <= max(global_ids):
+            raise ValueError(
+                f"rollout routing has {n_layers} layers but a MoE gate maps to global "
+                f"layer {max(global_ids)} (have {n_gates} gates at ids {global_ids})."
+            )
+        # (B, layers, topk, S) seq-last -> (B*S, layers, topk) token-major, one row per token
+        per_token = routing.permute(0, 3, 1, 2).reshape(b * s, n_layers, topk).long()
+        if self.packing_samples:
+            per_token = per_token.index_select(0, indices)  # drop pad tokens to match the packed order
+        return [per_token[:, gid, :].contiguous() for gid in global_ids]
+
     def _forward_backbone(
         self,
         sequences: torch.LongTensor,
@@ -523,6 +597,7 @@ class BaseModel(nn.Module):
         cp_context_stack,
         mm_inputs: dict,
         output_hidden_states: bool = False,
+        routed_experts: Optional[torch.Tensor] = None,
     ):
         """Input prep (packing / VLM token-type ids / CP sharding) + model call.
 
@@ -659,6 +734,23 @@ class BaseModel(nn.Module):
             cp_context_stack.enter_context(forward_ctx)
             forward_ctx = nullcontext()
 
+        # R3: replay the rollout's per-token expert selection so the training
+        # router picks the same experts (kills train/rollout routing drift). The
+        # ids are sharded to match this rank's packed / CP-local token order.
+        replay_ctx = nullcontext()
+        if routed_experts is not None:
+            from nemo_automodel.components.moe.router_replay import RouterReplay
+
+            replay_ctx = RouterReplay.replay(self._build_routing_targets(routed_experts, indices, cp_forward))
+            # R3 replay must stay active through the activation-checkpoint recompute in
+            # backward — otherwise the recompute reverts to the live router and disagrees
+            # with the replayed forward (CheckpointError: recomputed metadata differs).
+            # Keep it on the caller's stack (closed after backward), like the CP context
+            # above. The no-grad old-logprob recompute passes no stack -> forward-only.
+            if cp_context_stack is not None:
+                cp_context_stack.enter_context(replay_ctx)
+                replay_ctx = nullcontext()
+
         with forward_ctx:
             with autocast_ctx:
                 # Always pass sequences as the keyword `input_ids`. Some VLM
@@ -680,7 +772,8 @@ class BaseModel(nn.Module):
                     forward_kwargs["inputs_embeds"] = inputs_embeds
                 else:
                     forward_kwargs["input_ids"] = sequences
-                output = self.model(**forward_kwargs)
+                with replay_ctx:
+                    output = self.model(**forward_kwargs)
         # AutoModel's custom MoE/LLM models (e.g. Qwen3MoeForCausalLM) return a
         # raw logits Tensor; HF returns a ModelOutput with `.logits`. Normalize.
         output = _normalize_output(output)

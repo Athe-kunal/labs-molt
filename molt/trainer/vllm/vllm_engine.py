@@ -358,6 +358,7 @@ def create_vllm_engines(
     decode_context_parallel_size: int = 1,
     dtype: str = "bfloat16",
     mtp_num_speculative_tokens: int = 0,
+    enable_return_routed_experts: bool = False,
 ):
     """Spin up a set of vLLM Ray actors on a dedicated placement group.
 
@@ -514,6 +515,11 @@ def create_vllm_engines(
             # vLLM TP+EP hybrid: non-MoE layers stay TP-sharded across `tensor_parallel_size`
             # ranks; MoE experts are EP-distributed across the same ranks (one group per rank).
             actor_kwargs["enable_expert_parallel"] = True
+
+        if enable_return_routed_experts:
+            # R3: make vLLM return the router's per-token top-k expert ids so the
+            # training forward can replay the exact rollout routing (RouterReplay).
+            actor_kwargs["enable_return_routed_experts"] = True
 
         if logprobs_mode:
             # Don't cap max_logprobs: the RL path only requests logprobs=1, but

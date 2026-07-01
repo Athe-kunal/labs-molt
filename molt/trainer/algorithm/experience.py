@@ -61,6 +61,12 @@ class Experience:
     action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_theta(a|s)
     base_action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_ref(a|s)
     rollout_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) log pi_old(a|s)
+    # R3 rollout routing replay: the rollout router's top-k expert ids per token,
+    # one row per MoE layer. Stored seq-LAST as (B, num_moe_layers, topk, T) so it
+    # rides the same right-pad/concat/stack machinery as the (B, T) step tensors
+    # (zero_pad_sequences pads the last dim). The actor forward permutes it back to
+    # token-major and replays it (see Actor.forward / RouterReplay). None when R3 off.
+    routed_experts: torch.Tensor = tensor_field("step", default=None)
 
     # Policy-gradient targets
     returns: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) G_t (PPO: value-regression target)
@@ -258,7 +264,9 @@ def remove_padding_in_sequences(items: List[Experience]) -> List[Experience]:
         for f in fields(Experience):
             value = getattr(item, f.name)
             if isinstance(value, torch.Tensor) and Experience.is_step_tensor_field(f.name):
-                setattr(item, f.name, value[:right_pad])
+                # Slice the LAST (sequence) dim: 1D step tensors are [T], but
+                # routed_experts is [num_moe_layers, topk, T] (seq last).
+                setattr(item, f.name, value[..., :right_pad])
 
     return items
 

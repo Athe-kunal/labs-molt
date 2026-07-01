@@ -78,6 +78,7 @@ def train(args):
             decode_context_parallel_size=args.vllm.decode_context_parallel_size,
             dtype=args.vllm.dtype,
             mtp_num_speculative_tokens=args.vllm.mtp_num_speculative_tokens,
+            enable_return_routed_experts=args.train.routing_replay,
         )
 
     # init actor / reference / critic models
@@ -566,6 +567,14 @@ if __name__ == "__main__":
         default=False,
         help="Use vLLM pause/resume during weight sync so generation can overlap with training.",
     )
+    parser.add_argument(
+        "--train.routing_replay",
+        action="store_true",
+        default=False,
+        help="R3: capture the rollout router's per-token expert selection (vLLM) and replay it in "
+        "the training forward (AutoModel RouterReplay) so MoE training/rollout routing match. "
+        "MoE models only; incompatible with --train.partial_rollout_enable (preemption drops routing).",
+    )
 
     # Eval
     parser.add_argument("--eval.dataset", type=str, default=None, help="Path to the evaluation dataset")
@@ -686,6 +695,26 @@ if __name__ == "__main__":
     # --- Parallelism / FSDP ---
     if args.fsdp.pp_size > 1:
         raise NotImplementedError("Molt trainers are not pipeline-parallel aware yet; set --fsdp.pp_size 1")
+
+    if args.train.routing_replay and args.train.partial_rollout_enable:
+        # vLLM frees a request's captured routing on preemption, and partial
+        # rollout preempts in-flight requests at every weight sync -> the routing
+        # for those tokens would be lost. Keep partial rollout off under R3.
+        raise ValueError("--train.routing_replay is incompatible with --train.partial_rollout_enable.")
+
+    if args.train.routing_replay:
+        # Fail in seconds (not 2+ min into vLLM/model init) if the runtime's AutoModel
+        # predates Rollout Routing Replay (PR #2797). The vLLM side only needs
+        # enable_return_routed_experts; the training side needs this module + the Gate hooks.
+        try:
+            import nemo_automodel.components.moe.router_replay  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "--train.routing_replay needs AutoModel Rollout Routing Replay "
+                "(nemo_automodel.components.moe.router_replay, PR #2797). The installed nemo_automodel "
+                "predates it — rebuild the container with nemo-automodel >= 98e772cf0 (the requirements.txt "
+                "pin already includes it)."
+            ) from exc
 
     if args.fsdp.cp_size > 1 and args.fsdp.packing_samples:
         raise ValueError(

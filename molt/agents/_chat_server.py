@@ -390,10 +390,12 @@ def _extend_turn(state: ChatServerState, session: _Session, new_messages, sp):
     # after would record the grown state and make revert a no-op (double-counting the
     # image on retry -> placeholder-vs-pixel_values misalignment).
     lp = traj.rollout_log_probs
+    re = traj.routed_experts
     snap = (
         traj.observation_text,
         len(traj.observation_tokens),
         len(lp) if lp is not None else None,
+        len(re) if re is not None else None,
         len(traj.pil_images),
         traj.image_budget,
         traj.mm_train_inputs,
@@ -402,11 +404,13 @@ def _extend_turn(state: ChatServerState, session: _Session, new_messages, sp):
     traj.append_feedback("", delta_text, feedback_tokens)
 
     def revert():
-        text, n_tokens, n_logprobs, n_pil, budget, mm_inputs = snap
+        text, n_tokens, n_logprobs, n_routed, n_pil, budget, mm_inputs = snap
         traj.observation_text = text
         del traj.observation_tokens[n_tokens:]
         if traj.rollout_log_probs is not None and n_logprobs is not None:
             del traj.rollout_log_probs[n_logprobs:]
+        if traj.routed_experts is not None and n_routed is not None:
+            del traj.routed_experts[n_routed:]
         del traj.pil_images[n_pil:]
         traj.image_budget = budget
         traj.mm_train_inputs = mm_inputs
@@ -493,6 +497,7 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
     if traj.rollout_log_probs is not None:
         action_logprobs = _extract_generation_logprobs(action_tokens, gen.logprobs)
     traj.append_action(action_tokens, action_logprobs, off_policy_len=off_policy_len)
+    traj.absorb_routing(request_output)  # fills routing by absolute position (R3)
 
     session.prior_messages = list(messages) + [{"role": "assistant", "content": action_text}]
     session.last_action = action_text

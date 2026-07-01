@@ -362,6 +362,8 @@ class PolicyTrainer:
             # entropy_coef=0.0 disables the entropy term in loss. Skip the
             # entropy forward path entirely in that case.
             return_entropy=bool(self.args.actor.entropy_coef),
+            # R3: replay the rollout's expert selection (None when routing replay off).
+            routed_experts=experience.routed_experts,
             **multimodal_inputs,
         )
         action_log_probs = model_output["action_log_probs"]
@@ -662,6 +664,7 @@ class PolicyModelActor(BaseModelActor):
             freeze_visual_encoder=getattr(strategy.args.actor, "freeze_visual_encoder", False),
             freeze_moe_router=getattr(strategy.args.actor, "freeze_moe_router", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
+            routing_replay=getattr(args.train, "routing_replay", False),
         )
         if vllm_engines is not None:
             adapter = getattr(actor.model, "state_dict_adapter", None)
@@ -760,6 +763,7 @@ class PolicyModelActor(BaseModelActor):
         action_mask: Optional[Union[int, list[int]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         mm_train_inputs_list=None,
+        routed_experts=None,
     ) -> torch.Tensor:
         """Generate actor action log probabilities."""
         device = torch.cuda.current_device()
@@ -775,6 +779,8 @@ class PolicyModelActor(BaseModelActor):
                 sequences.to(device),
                 action_mask.to(device),
                 attention_mask.to(device),
+                # R3: replay rollout routing for the old-logprob recompute too.
+                routed_experts=routed_experts.to(device) if routed_experts is not None else None,
                 **mm_inputs,
             )
         self.actor.train()  # reset model state

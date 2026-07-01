@@ -432,6 +432,7 @@ Molt targets AutoModel custom models with FSDP2:
 | vLLM tensor parallel | `--vllm.tensor_parallel_size 2` |
 | vLLM expert parallel | `--vllm.enable_expert_parallel` |
 | MTP rollout spec-decode | `--vllm.mtp_num_speculative_tokens 1` |
+| MoE router replay (R3) | `--train.routing_replay` |
 
 For CP training, packed RL batches are currently disabled. Packing is off by
 default, and CP rejects `--fsdp.packing_samples`.
@@ -463,6 +464,32 @@ Notes:
   auto-detects MTP for the *Super*-Omni arch (not Nano) — so omni3 rollout-MTP is
   unavailable until upstream adds it; vLLM errors at engine init if enabled on an
   unsupported checkpoint.
+
+### 🎯 Router Replay (R3)
+
+MoE RL is unstable because the rollout (vLLM) and training (FSDP) routers pick
+experts **independently** — even at identical weights, numerical differences
+flip a fraction of the top-k per layer, compounding until most tokens route to
+different experts than they did during rollout. That breaks the importance-
+sampling assumption behind GRPO/GSPO. **Rollout Routing Replay**
+([R3, arXiv:2510.11370](https://arxiv.org/abs/2510.11370)) fixes it at the
+source: vLLM returns the per-token expert ids it chose, and the training forward
+replays that exact selection. One flag:
+
+```bash
+--train.routing_replay   # off by default
+```
+
+- **Freezes the routing, not the router.** Only the discrete top-k *selection* is
+  replayed; the router logits are still recomputed from the live weights, so the
+  gradient keeps flowing into the router (it keeps learning) — a lighter touch
+  than freezing the router weights outright.
+- **Full-sequence, absolute-position aligned**: the prompt+response routing is laid
+  down by token position; positions the engine returns no routing for keep their
+  natural (live) selection.
+- Needs AutoModel `RouterReplay` (`nemo_automodel.components.moe.router_replay`,
+  PR #2797). Opt-in; incompatible with `--train.partial_rollout_enable` (vLLM
+  frees routing on preemption).
 
 ## ✅ Validation
 

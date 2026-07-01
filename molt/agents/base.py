@@ -113,6 +113,15 @@ class Trajectory:
     # denominator (slime's mask_offpolicy_in_partial_rollout). 0 when on-policy.
     off_policy_action_lens: list = field(default_factory=list)
     rollout_log_probs: list | None = None
+    # R3 rollout routing replay: per-token MoE expert selection captured from the rollout
+    # engine, aligned 1:1 with `observation_tokens` by absolute position (filled by
+    # absorb_routing). Each entry is a ``[num_moe_layers, topk]`` int16 row, or None where
+    # the engine returned no routing (the trailing sampled token, or — on engines that
+    # don't route multimodal prompts — those positions); None becomes a sentinel
+    # downstream so the training forward routes them naturally. None on the whole field
+    # when capture is off. The training forward replays the captured rows so its router
+    # picks the rollout's experts (AutoModel RouterReplay).
+    routed_experts: list | None = None
     reward: float = 0.0
     scores: float = 0.0  # mirrors the dict key "scores" (plural for legacy reasons)
     truncated: bool = False
@@ -127,12 +136,44 @@ class Trajectory:
         self.off_policy_action_lens.append(int(off_policy_len))
         if self.rollout_log_probs is not None:
             self.rollout_log_probs.extend(action_logprobs or [0.0] * len(action_tokens))
+        if self.routed_experts is not None:
+            # placeholders; absorb_routing() fills them by absolute position (R3)
+            self.routed_experts.extend([None] * len(action_tokens))
 
     def append_feedback(self, action_text: str, feedback_text: str, feedback_tokens):
         self.observation_text = self.observation_text + action_text + feedback_text
         self.observation_tokens.extend(feedback_tokens)
         if self.rollout_log_probs is not None:
             self.rollout_log_probs.extend([0.0] * len(feedback_tokens))
+        if self.routed_experts is not None:
+            # placeholders; the next turn's absorb_routing() fills them from its prefill
+            # routing (by absolute position), else they stay None -> natural routing.
+            self.routed_experts.extend([None] * len(feedback_tokens))
+
+    def absorb_routing(self, request_output):
+        """Place this turn's rollout MoE routing onto ``routed_experts`` (R3).
+
+        The rollout engine returns the per-token expert ids for the tokens it processed,
+        indexed from absolute position 0. The engine ships the generated-token ids on the
+        completion and, when it splits them out, the prompt ids on the request;
+        concatenating reconstructs the sequence (a unified-array engine returns it all on
+        the completion, with no prompt split).
+        We lay it down first-writer-wins so each token keeps the routing from the turn
+        that first produced it, leaving positions the engine gave no routing for as None
+        (a sentinel downstream, so the training forward routes them naturally). No-op when
+        capture is off. Call AFTER :meth:`append_action` so the generated positions exist.
+        """
+        gen = getattr(request_output.outputs[0], "routed_experts", None)
+        if gen is None:
+            return
+        prompt = getattr(request_output, "prompt_routed_experts", None)
+        routed = (list(prompt) + list(gen)) if prompt is not None else list(gen)
+        if self.routed_experts is None:
+            self.routed_experts = [None] * len(self.observation_tokens)
+        for i in range(min(len(routed), len(self.routed_experts))):
+            if self.routed_experts[i] is None:
+                # copy: the engine hands back a read-only view under async D2H
+                self.routed_experts[i] = routed[i].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +334,7 @@ class StepEnvRunner(Runner):
             if trajectory.rollout_log_probs is not None:
                 action_logprobs = _extract_generation_logprobs(action_tokens, generation.logprobs)
             trajectory.append_action(action_tokens, action_logprobs, off_policy_len=off_policy_len)
+            trajectory.absorb_routing(request_output)  # fills routing by absolute position (R3)
 
             feedback_tokens = _tokenize_feedback(
                 hf_tokenizer, result.observation, result.images, trajectory, max_length

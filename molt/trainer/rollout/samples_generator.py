@@ -2,6 +2,7 @@ import heapq
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import ray
 import torch
 from tqdm import tqdm
@@ -514,11 +515,30 @@ class SamplesGenerator:
             if isinstance(value, (int, float, bool)):
                 info[key] = torch.tensor([value])
 
+        # R3: per-token rollout routing aligned with `sequences` (one [L, K] expert-id
+        # row per token), seq last after the permute below.
+        routed_experts = None
+        if response.routed_experts is not None:
+            row_shape = next((r.shape for r in response.routed_experts if r is not None), None)
+            if row_shape is not None:
+                # Positions with no captured rollout routing (a multimodal prompt the engine
+                # didn't route, feedback, the trailing token) get a -1 sentinel: the training
+                # forward keeps its own natural routing there (RouterReplay). Zeros would
+                # instead force those tokens to expert 0 and corrupt the forward.
+                sentinel = np.full(row_shape, -1, dtype=np.int16)
+                rows = [r if r is not None else sentinel for r in response.routed_experts]
+                # int16, not the engine's uint8: the training side pads the CP tail with the -1
+                # sentinel, which on uint8 wraps to 255 and (for models with <256 experts, e.g.
+                # omni3's 128) indexes out of bounds -> device-side assert in the router gather.
+                arr = np.stack(rows).astype(np.int16)[:truncate_length]  # (T, L, K), aligned with sequences
+                routed_experts = torch.from_numpy(arr).permute(1, 2, 0).contiguous().unsqueeze(0)  # (1, L, K, T)
+
         experience = Experience(
             sequences=sequences.unsqueeze(0),
             attention_mask=attention_mask.unsqueeze(0),
             action_mask=action_mask.unsqueeze(0),
             rollout_log_probs=rollout_log_probs.unsqueeze(0) if rollout_log_probs is not None else None,
+            routed_experts=routed_experts,
             prompts=[response.prompt],
             labels=[response.label],
             images=[response.images],

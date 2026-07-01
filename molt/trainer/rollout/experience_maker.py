@@ -141,11 +141,19 @@ class RemoteExperienceMaker:
         colocated_policy_workers = getattr(args.train, "colocate_fsdp_models", False) and (
             self.initial_model_group is not None or self.critic_model_group is not None
         )
-        # Actor model (receives mm_train_inputs_list for VLM)
+        # Actor model (receives mm_train_inputs_list for VLM). R3: the old-logprob
+        # recompute must replay the rollout's routing too, so old/new logprobs differ
+        # only by the weight update (not by routing drift) and vllm_kl actually drops.
+        # Only the actor replays — the reference/critic are different policies.
+        actor_forward_kwargs = dict(vlm_forward_kwargs)
+        if any(s.routed_experts is not None for s in samples_list):
+            # async_run_method_batch fans this list out one-per-sample, like
+            # mm_train_inputs_list, so each forward gets its own (1, L, K, T) tensor.
+            actor_forward_kwargs["routed_experts"] = [s.routed_experts for s in samples_list]
         action_log_probs_ref = self._dispatch_forward(
             self.actor_model_group,
             colocated_policy_workers,
-            **vlm_forward_kwargs,
+            **actor_forward_kwargs,
         )
 
         # Reference model (also receives mm_train_inputs_list for VLM)

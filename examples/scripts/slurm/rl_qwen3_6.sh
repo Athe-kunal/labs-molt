@@ -354,6 +354,7 @@ RL_ARGS=(
   --train.num_episodes "${NUM_EPISODES:-1}"
   --train.async_queue_size "$ASYNC_QUEUE_SIZE"
   --train.colocate_fsdp_models
+  ${ROUTING_REPLAY:+--train.routing_replay}
   --actor.num_nodes "$ACTOR_NODES"
   --actor.num_gpus_per_node "$ACTOR_GPUS_PER_NODE"
   --ref.num_nodes "$ACTOR_NODES"
