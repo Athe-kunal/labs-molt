@@ -145,6 +145,7 @@ Read every line that touches your gradients, in plain PyTorch.
 | PPO critic | `--algo.advantage.estimator gae` adds a value model: its own Ray group (`CriticModelActor`), colocated on the actor's GPUs by default or disaggregatable, GAE advantages (`--algo.advantage.lam`) + clipped value loss (`--critic.value_clip`), own optimizer/LR (`--critic.adam.lr`) and resumable `_critic` checkpoint. Built on `NeMoAutoModelForCausalLM` + a scalar value head, so it keeps the native TP / EP / CP path |
 | Distillation | On-policy distillation — per-token reverse KL to a frozen teacher, via `--algo.advantage.estimator on_policy_distill` + `--ref.model_name_or_path` |
 | IS correction | `tis`, `icepop`, `seq-mask-tis` (off-policy / async rollout) |
+| MoE router freeze | `--actor.freeze_moe_router` holds the gate/router weights fixed so vLLM and the actor keep routing tokens to the same experts. Stabilizes MoE RL / distillation and shrinks the same rollout-vs-train logprob gap the IS-correction filters address — a router that drifts between refits is a large source of that gap |
 | Optimizer | `adam` (default). `muon` (Newton–Schulz, 2D-weight group) is **experimental and currently unavailable** — its distributed (FSDP / EP) path does not yet work; use `adam` |
 | KL | Optional reference workers when `--algo.kl.init_coef > 0` (the reference doubles as the distillation teacher) |
 
@@ -208,6 +209,7 @@ Common RL switches:
 | Keep rollout alive during sync | `--train.partial_rollout_enable` |
 | Filter by agent scores | `--algo.dynamic_filtering_enable --algo.dynamic_filtering_range 0.0 1.0` |
 | Correct async rollout logprobs | `--algo.advantage.is_correction_enable --algo.advantage.is_correction_type seq-mask-tis` |
+| Freeze MoE routing (stabilize MoE RL) | `--actor.freeze_moe_router` |
 | On-policy distillation | `--algo.advantage.estimator on_policy_distill --ref.model_name_or_path /path/to/teacher` |
 
 ## 🤖 Agent Contract
