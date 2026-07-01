@@ -166,6 +166,7 @@ EP_SIZE="${EP_SIZE:-8}"
 CP_SIZE="${CP_SIZE:-8}"
 FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-te}"
 FREEZE_VISUAL_ENCODER="${FREEZE_VISUAL_ENCODER:-1}"
+FREEZE_MOE_ROUTER="${FREEZE_MOE_ROUTER:-1}"
 # Algo — distillation strength (reverse-KL reward coefficient) defaults to 1.0; tune via LR.
 MOE_AUX_LOSS_COEF="${MOE_AUX_LOSS_COEF:-0}"
 LR="${LR:-1e-5}"
@@ -374,6 +375,10 @@ fi
 
 if [ "$FREEZE_VISUAL_ENCODER" = "1" ]; then
   RL_ARGS+=(--actor.freeze_visual_encoder)
+fi
+
+if [ "$FREEZE_MOE_ROUTER" = "1" ]; then
+  RL_ARGS+=(--actor.freeze_moe_router)
 fi
 
 if [ "${LOAD_ENABLE:-0}" = "1" ]; then

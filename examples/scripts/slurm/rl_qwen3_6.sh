@@ -207,6 +207,7 @@ EP_SIZE="${EP_SIZE:-8}"
 CP_SIZE="${CP_SIZE:-1}"
 FSDP_ATTN_IMPLEMENTATION="${FSDP_ATTN_IMPLEMENTATION:-sdpa}"
 FREEZE_VISUAL_ENCODER="${FREEZE_VISUAL_ENCODER:-1}"
+FREEZE_MOE_ROUTER="${FREEZE_MOE_ROUTER:-1}"
 # Algo — defaults tuned for geo3k VLM math multi-turn.
 KL_COEF="${KL_COEF:-0.0}"
 MOE_AUX_LOSS_COEF="${MOE_AUX_LOSS_COEF:-0.000}"
@@ -444,6 +445,10 @@ fi
 
 if [ "$FREEZE_VISUAL_ENCODER" = "1" ]; then
   RL_ARGS+=(--actor.freeze_visual_encoder)
+fi
+
+if [ "$FREEZE_MOE_ROUTER" = "1" ]; then
+  RL_ARGS+=(--actor.freeze_moe_router)
 fi
 
 # Resume from the last checkpoint at $SAVE_ROOT/state. Set LOAD_ENABLE=1 (and
