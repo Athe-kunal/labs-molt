@@ -1,4 +1,4 @@
-# molt — the project image: CUDA-13 (native CUDA 13; H100 sm_90 baseline + Blackwell sm_100 GB100/GB200).
+# molt — the project image: CUDA-13 (native CUDA 13; A100 sm_80, H100/H200 sm_90, B200/GB200 sm_100).
 #
 # Base: OFFICIAL Docker Hub pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
 #   (torch 2.11.0 *stable* + CUDA 13.0 + cuDNN 9.19, python 3.12, Ubuntu 24.04).
@@ -27,12 +27,16 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
     DEBIAN_FRONTEND=noninteractive \
     RDMA_CORE_HOME=/opt/rdma-core/build
 
-# python 3.12 site-packages. GPU arches: H100 sm_90 (baseline) + Blackwell sm_100
-# (GB100 / GB200). ARCH_LIST / NVTE_CUDA_ARCHS drive every --no-build-isolation source
-# build below (TE, flash-attn, mamba, causal_conv1d, DeepEP). CUDA 13 compiles sm_100.
+# python 3.12 site-packages. GPU arches: A100 sm_80 (Ampere) + H100/H200 sm_90 (Hopper) +
+# B200/GB200 sm_100 (Blackwell). ARCH_LIST / NVTE_CUDA_ARCHS drive the TE / flash-attn /
+# mamba / causal_conv1d source builds — all support Ampere, so sm_80 is included there.
+# DeepEP is Hopper+ ONLY: its kernels use Hopper wgmma/TMA + IBGDA and do NOT compile for
+# sm_80, so it builds against the narrower DEEPEP_ARCH_LIST. A100 therefore runs the
+# TE/flash-attn/mamba SFT + medium-inference path, not DeepEP expert-parallel.
 ARG SITE=/usr/local/lib/python3.12/dist-packages
-ARG ARCH_LIST="9.0 10.0"
-ARG NVTE_CUDA_ARCHS="90;100"
+ARG ARCH_LIST="8.0 9.0 10.0"
+ARG NVTE_CUDA_ARCHS="80;90;100"
+ARG DEEPEP_ARCH_LIST="9.0 10.0"
 
 # torch's bundled nvidia-*-cu13 wheels hold cudnn.h / nccl.h / cublas etc. The bare base
 # has no system NCCL/cuDNN dev headers, so every --no-build-isolation source build (TE,
@@ -134,7 +138,7 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages rdma-core 
     apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
     env RDMA_CORE_HOME=${RDMA_CORE_HOME} HYBRID_EP_MULTINODE=1 \
         LD_LIBRARY_PATH=/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-} \
-        TORCH_CUDA_ARCH_LIST="${ARCH_LIST}" MAX_JOBS=8 \
+        TORCH_CUDA_ARCH_LIST="${DEEPEP_ARCH_LIST}" MAX_JOBS=8 \
         python -m pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* /opt/deepep.patch && cd / && rm -rf /opt/DeepEP
