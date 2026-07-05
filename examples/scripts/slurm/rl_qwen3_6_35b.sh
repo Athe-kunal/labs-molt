@@ -383,7 +383,7 @@ RL_ARGS=(
   --algo.advantage.estimator reinforce_baseline
   --algo.advantage.is_correction_enable
   --algo.advantage.is_correction_type seq-mask-tis
-  --algo.advantage.is_correction_threshold "${IS_LOW:-0.95}" "${IS_HIGH:-1.05}"
+  --algo.advantage.is_correction_threshold "${IS_LOW:-0.99}" "${IS_HIGH:-1.01}"
   --algo.kl.use_loss
   --algo.kl.estimator k2
   --algo.kl.init_coef "$KL_COEF"
