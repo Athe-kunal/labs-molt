@@ -49,20 +49,27 @@ _TOOLS = {_PYTHON_EXECUTOR.schema["function"]["name"]: _PYTHON_EXECUTOR}
 _MAX_TURNS = int(os.environ.get("MAX_AGENT_TURNS", "5"))
 _ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
 _BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
-_PARSER_CLS_PATH = os.environ.get(
-    "VLLM_TOOL_PARSER_CLS",
-    "vllm.tool_parsers.qwen3xml_tool_parser.Qwen3XMLToolParser",
-)
+# Default candidates cover the vLLM rename: <=0.23 ships Qwen3XMLToolParser,
+# >=0.24 replaces it with the Rust-backed Qwen3EngineToolParser (same interface).
+_PARSER_CLS_PATHS = [
+    os.environ.get("VLLM_TOOL_PARSER_CLS") or "vllm.tool_parsers.qwen3xml_tool_parser.Qwen3XMLToolParser",
+    "vllm.tool_parsers.qwen3_engine_tool_parser.Qwen3EngineToolParser",
+]
 _PARSER = None
 
 
 def _load_parser():
     from transformers import AutoTokenizer
 
-    module_path, _, cls_name = _PARSER_CLS_PATH.rpartition(".")
-    cls = getattr(__import__(module_path, fromlist=[cls_name]), cls_name)
     tok = AutoTokenizer.from_pretrained(os.environ["MODEL_PATH"], trust_remote_code=True)
-    return cls(tok)
+    for path in _PARSER_CLS_PATHS:
+        module_path, _, cls_name = path.rpartition(".")
+        try:
+            cls = getattr(__import__(module_path, fromlist=[cls_name]), cls_name)
+        except (ImportError, AttributeError):
+            continue
+        return cls(tok)
+    raise ImportError(f"no vLLM qwen3 tool parser found among {_PARSER_CLS_PATHS}")
 
 
 def _extract_tool_call(text: str) -> dict[str, Any] | None:
