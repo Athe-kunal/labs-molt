@@ -526,7 +526,7 @@ class PolicyTrainer:
 
         ep_size = getattr(self.strategy.args.fsdp, "ep_size", 1) or 1
 
-        # Pack many small per-tensor broadcasts into ~1 GiB batched broadcasts.
+        # Pack many small per-tensor broadcasts into large batched broadcasts.
         # Inspired by vLLM's `vllm.distributed.weight_transfer.packed_tensor`
         # — same idea, simplified (no double-buffer streams) since FSDP
         # `gather_full_param` already serializes on the default stream so
@@ -535,7 +535,7 @@ class PolicyTrainer:
         #
         # Only trainer rank 0 holds `_model_update_group`; non-rank-0 ranks
         # still call `gather_full_param` (an FSDP collective) but drop the
-        # gathered tensor immediately — no point staging ~1 GiB on every rank.
+        # gathered tensor immediately — no point staging the batch on every rank.
         is_rank0 = torch.distributed.get_rank() == 0
         # 512 MiB flushes, matching slime's `--update-weight-buffer-size` default
         # (512 * 1024**2). vLLM runs at high gpu_memory_utilization (~0.9-0.95) with

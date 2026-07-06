@@ -8,12 +8,13 @@ may emit `<answer>ANSWER</answer>` (or `\\boxed{ANSWER}` for legacy
 training distributions); the final value found at trajectory end is graded
 against the ground truth — that grade becomes the trajectory reward.
 
-Tool-call parsing prefers vLLM's `ToolParserManager` (default `Qwen3XMLToolParser`
-covers Qwen3.5/3.6 Hermes XML; swap via `VLLM_TOOL_PARSER_CLS`).
+Tool-call parsing uses vLLM's qwen3 XML tool parser, imported by dotted class
+path with a version fallback (Qwen3XMLToolParser on vLLM <=0.23,
+Qwen3EngineToolParser on >=0.24); override via `VLLM_TOOL_PARSER_CLS`.
 
 Environment variables:
   MAX_AGENT_TURNS         (default 5)       — caps tool_call iterations.
-  VLLM_TOOL_PARSER_CLS    (default qwen3xml)
+  VLLM_TOOL_PARSER_CLS    — full dotted class path of a vLLM ToolParser.
   PYTHON_EXECUTOR_TIMEOUT (default 10)      — wall-clock per tool call (s).
 """
 

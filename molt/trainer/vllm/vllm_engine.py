@@ -378,16 +378,13 @@ def create_vllm_engines(
             actor_kwargs["block_size"] = block_size
 
         if mamba_ssm_cache_dtype:
-            # Hybrid Mamba2 models (NemotronH / omni3): vLLM's NemotronH config
-            # handler defaults the SSM state cache to float16 when unset (see
-            # vllm model_executor/models/config.py NemotronHForCausalLMConfig).
-            # A low-precision recurrent SSM cache accumulates rounding error
-            # across a long rollout, so vLLM rollout log-probs drift from the
-            # fp32 training recompute (omni3: vllm_kl ~0.034, which makes the
-            # seq-mask-TIS geometric-mean ratio sit at exp(-0.034)=0.966 and a
-            # tight band drop ~everything). Force fp32 to match training —
-            # opd-rl/nemo-rl set mamba_ssm_cache_dtype="float32" for nanov3vl.
-            # No-op for non-Mamba models (vLLM ignores it).
+            # Recurrent-state models (Mamba2 / GDN hybrids): vLLM defaults the
+            # SSM state cache to the model dtype, and a low-precision recurrent
+            # cache accumulates rounding error across a long rollout, drifting
+            # rollout log-probs from the fp32 training recompute (inflates
+            # vllm_kl and over-triggers the seq-mask-TIS filter). Force fp32 to
+            # match training — NeMo-RL's hybrid-model recipes set the same.
+            # No-op for non-recurrent models (vLLM ignores it).
             actor_kwargs["mamba_ssm_cache_dtype"] = mamba_ssm_cache_dtype
 
         if enable_expert_parallel:
