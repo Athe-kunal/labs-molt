@@ -151,6 +151,8 @@ core
 exp
 wandb
 .claude/*
+# Ship the project skills (Claude Code loads them for every contributor)
+!.claude/skills/
 
 # Local verification outputs
 .tmp*/
