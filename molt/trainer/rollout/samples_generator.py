@@ -89,22 +89,17 @@ class SamplesGenerator:
         self.prompts_dataloader = prompts_dataloader
         self.eval_dataloader = eval_dataloader
 
-    # Warm-resume (opt-in via --ckpt.warm_resume_rollouts; NeMo-RL replay_buffer.pt analogue):
-    # persist the completed-but-unshipped rollout groups so a resumed run trains them immediately
-    # instead of idling ~one generation while the async pipeline refills. Only complete, filtered
-    # groups are in _finished_samples; the train-computed fields (advantages/action_log_probs/…)
-    # are still None here, so we persist near-minimal — the rollout tensors we need
-    # (tokens + rollout_log_probs + R3 routed_experts + mm inputs) plus cheap None placeholders.
-    # Written to a SIDECAR FILE (not the state_dict itself): routing the multi-GB batch through
-    # the Ray queue/driver bloated the checkpoint ~1000x and crashed the driver. Best-effort at
-    # both ends — a failed save or missing/unreadable file falls back to the stateless resume.
+    # Warm-resume (opt-in via --ckpt.warm_resume_rollouts). At every train step, save the rollout
+    # groups that finished but were NOT trained yet — the surplus kept beyond the batch just shipped
+    # (self._finished_samples) — so a resumed run trains them right away instead of idling ~one
+    # generation while the pipeline refills. Each step writes a FRESH file (never overwritten), so a
+    # resume restores exactly its own checkpoint's untrained groups. Only the file PATH is returned;
+    # the groups themselves are large and must not travel the Ray queue. Best-effort: on any failure
+    # the run just resumes normally (regenerating those groups).
     _BUFFER = "rollout_buffer.pt"
 
     def state_dict(self) -> Dict:
-        """Save the completed-but-unshipped rollouts to a fresh sidecar file per checkpoint and
-        return its path (NeMo-RL replay_buffer.pt analogue). A unique file per checkpoint means
-        each checkpoint restores ITS OWN buffer (no overwrite/desync); only the PATH goes in the
-        state_dict (the multi-GB batch must not travel the Ray queue). Best-effort."""
+        """Save this step's untrained rollout groups to a fresh sidecar file, return its path."""
         finished = getattr(self, "_finished_samples", None)
         if not getattr(self.args.ckpt, "warm_resume_rollouts", False) or not finished:
             return {}
@@ -112,19 +107,20 @@ class SamplesGenerator:
             d = os.path.join(os.path.dirname(self.args.ckpt.path.rstrip("/")), "rollout_warm")
             os.makedirs(d, exist_ok=True)
             self._warm_seq = getattr(self, "_warm_seq", 0) + 1
-            path = os.path.join(d, f"{self._BUFFER}.{os.getpid()}.{self._warm_seq}")  # pid: unique across segments
+            path = os.path.join(d, f"{self._BUFFER}.{os.getpid()}.{self._warm_seq}")  # pid+seq: unique per step
             torch.save(list(finished), path)
             for stale in sorted(os.scandir(d), key=lambda e: e.stat().st_mtime)[:-3]:  # keep newest 3; bound disk
                 os.remove(stale.path)
             return {"buffer_file": path}
-        except Exception as e:  # never break the checkpoint over warm-resume bookkeeping
+        except Exception as e:  # bookkeeping must never break the checkpoint
             logger.warning(f"warm-resume: save skipped ({e})")
             return {}
 
     def load_state_dict(self, state_dict: Optional[Dict]) -> None:
+        """Restore this checkpoint's untrained groups (if any) to seed the first post-resume batch."""
         path = (state_dict or {}).get("buffer_file")
         if not path or not os.path.exists(path):
-            return  # optional: no buffer / failed save -> stateless resume
+            return  # no file / failed save -> normal resume
         try:
             self._resumed_samples = torch.load(path, map_location="cpu", weights_only=False)
             logger.info(f"warm-resume: restored {len(self._resumed_samples)} rollout groups")

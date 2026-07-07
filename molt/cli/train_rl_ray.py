@@ -250,10 +250,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt.warm_resume_rollouts",
         action="store_true",
-        help="Persist the completed-but-unshipped rollout groups beside the checkpoint so a "
-        "resumed async run trains them immediately instead of idling ~one generation while the "
-        "pipeline refills (NeMo-RL replay_buffer analogue). Opt-in/experimental; best-effort — a "
-        "failed save or missing file falls back to the stateless resume.",
+        help="At each train step, save the rollout groups that finished but were not trained yet, "
+        "so a resumed async run trains them immediately instead of idling ~one generation while "
+        "the pipeline refills. Opt-in/experimental; best-effort — a failed save or missing file "
+        "falls back to a normal resume.",
     )
     # wandb + TensorBoard + logging cadence.
     add_logger_args(parser, default_wandb_project="molt_train_rl", run_name_prefix="rl")
