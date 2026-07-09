@@ -114,8 +114,11 @@ def _inference_sampling_params(sp) -> dict:
         "top_p": sp.top_p,
         "skip_special_tokens": getattr(sp, "skip_special_tokens", True),
     }
-    if getattr(sp, "top_k", -1) not in (-1, 0, None):
-        fields["top_k"] = sp.top_k
+    # ALWAYS send top_k: when omitted the server silently falls back to the model's
+    # generation_config (Qwen ships top_k=20), diverging sampling from the training
+    # config AND renormalizing returned logprobs over the truncated support.
+    tk = getattr(sp, "top_k", -1)
+    fields["top_k"] = tk if tk not in (0, None) else -1
     if getattr(sp, "min_tokens", 0):
         fields["min_tokens"] = sp.min_tokens
     if getattr(sp, "seed", None) is not None:
@@ -249,7 +252,9 @@ class RouterGenerateClient:
             raise RuntimeError("/inference/v1/generate returned no logprobs.content despite logprobs=1.")
         if content and len(content) != len(ids):
             raise RuntimeError(f"logprobs.content count {len(content)} != completion tokens {len(ids)}.")
-        logprobs = [{t: SimpleNamespace(logprob=float(item.get("logprob", 0.0)))} for t, item in zip(ids, content)]
+        if any("logprob" not in item for item in content):
+            raise RuntimeError("/inference/v1/generate returned a logprobs.content entry without a logprob field.")
+        logprobs = [{t: SimpleNamespace(logprob=float(item["logprob"]))} for t, item in zip(ids, content)]
         fr = c.get("finish_reason")
         finish_reason = fr.get("type") if isinstance(fr, dict) else (fr or "stop")
         # routed_experts is the UNIFIED full-sequence [tokens,layer,topk] npy (prompt+gen); absorb_routing
