@@ -402,6 +402,16 @@ class BaseRLTrainer:
         status: dict = {}
         for result in ray.get(refs):
             status.update(result)
+        # Fail loudly when the vLLM-IS filter dropped every sequence: the policy
+        # gradient is exactly zero and the run silently optimizes nothing. The
+        # usual cause is rollout-vs-train forward mismatch, for MoE models most
+        # often unreplayed expert routing — enable --train.routing_replay.
+        if status.get("is_filter_ratio", 0.0) >= 0.999:
+            logger.warning(
+                f"is_filter_ratio={status['is_filter_ratio']:.3f}: the vLLM importance-sampling filter dropped "
+                f"(nearly) every sequence — zero policy gradient this step (vllm_kl={status.get('vllm_kl')}). "
+                "Rollout and training forwards disagree; for MoE models enable --train.routing_replay."
+            )
         if self.critic_model_group is not None:
             # Colocated actor and critic are separate processes sharing the same GPUs.
             # Release the actor's cached GPU blocks back to the driver before the critic
