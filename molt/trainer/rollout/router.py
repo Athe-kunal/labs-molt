@@ -123,10 +123,17 @@ def _inference_sampling_params(sp) -> dict:
         fields["min_tokens"] = sp.min_tokens
     if getattr(sp, "seed", None) is not None:
         fields["seed"] = sp.seed
-    for name, default in (("repetition_penalty", 1.0), ("frequency_penalty", 0.0), ("presence_penalty", 0.0)):
+    # Penalties and min_p are ALSO sent unconditionally: any field omitted from the
+    # request is silently filled from the checkpoint's generation_config, decoupling
+    # rollout sampling from the training configuration.
+    for name, default in (
+        ("repetition_penalty", 1.0),
+        ("frequency_penalty", 0.0),
+        ("presence_penalty", 0.0),
+        ("min_p", 0.0),
+    ):
         v = getattr(sp, name, None)
-        if v is not None and v != default:
-            fields[name] = v
+        fields[name] = default if v is None else v
     for name in ("stop", "stop_token_ids"):
         v = getattr(sp, name, None)
         if v:
