@@ -475,7 +475,8 @@ Molt targets AutoModel custom models with FSDP2:
 | | Context parallel | `--fsdp.cp_size 8` (32K+ sequences) |
 | | Optimizer CPU offload | `--fsdp.offload optimizer` (frees VRAM for the largest actors) |
 | **vLLM rollout** | Tensor parallel | `--vllm.tensor_parallel_size 2` |
-| | Expert parallel | `--vllm.enable_expert_parallel` |
+| | Expert parallel | `--vllm.enable_expert_parallel` (EP = TP × DP) |
+| | Data parallel | `--vllm.data_parallel_size 4` (raises EP past TP — DeepSeek-V3-style TP8+DP4 → EP32) |
 | | Scheduler token budget | `--vllm.max_num_batched_tokens 32768` |
 | | MTP spec-decode | `--vllm.mtp_num_speculative_tokens 1` |
 | **MoE stability** | Router replay (R3) | `--train.routing_replay` |

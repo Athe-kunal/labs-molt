@@ -27,7 +27,16 @@ class WorkerWrap:
         assert torch.distributed.is_initialized(), "default torch process group must be initialized"
         assert group_name != "", "group name must not be empty"
 
-        rank = torch.distributed.get_rank() + rank_offset
+        # Each engine occupies engine_world = TP*PP*DP consecutive ranks. But a
+        # worker's default torch group spans only its own TP*PP replica: under the
+        # ray/mp executor vLLM sizes world_size as TP*PP (config/parallel.py), so
+        # get_rank() restarts at 0 in every data-parallel replica. Offset by
+        # dp_rank * (TP*PP) so the DP replicas of one engine don't collide on the
+        # same weight-sync rank. dp_rank defaults to 0, keeping DP=1 unchanged.
+        local_world = torch.distributed.get_world_size()
+        parallel_config = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
+        dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0) or 0)
+        rank = dp_rank * local_world + torch.distributed.get_rank() + rank_offset
         self._model_update_group = stateless_init_process_group(
             master_address,
             master_port,
