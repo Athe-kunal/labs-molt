@@ -49,25 +49,17 @@ def get_model_parallel_size(args) -> int:
 
 
 def _fill_missing_routed_experts(items: List["Experience"]) -> None:
-    """In place: give samples with no captured routing a full -1 (natural-routing) block.
-
-    ``routed_experts`` is None for a rollout the engine returned no routing for. Batched
-    next to routed samples, the first-element merge dispatch would otherwise drop the batch's
-    routing (leading None) or crash on ``None.size(-1)`` (trailing None). Materialize the -1
-    sentinel sized to the sample's OWN sequence length (routed_experts is seq-aligned with
-    ``sequences``) so it pads to the same seq dim as everything else after concat/stack; -1
-    means "keep live routing" on every token, exactly "no captured routing". No-op unless
-    some — but not all — samples in the batch carry routing.
-    """
-    present = [it.routed_experts for it in items if it.routed_experts is not None]
-    if not present or len(present) == len(items):
+    """Give un-routed samples (routed_experts=None) an all -1 (natural-routing) block sized to
+    their own sequence, so a batch mixing captured routing with None neither drops the routing
+    (leading None) nor crashes on None.size(-1) (trailing None) in the first-element merge."""
+    routed = next((it.routed_experts for it in items if it.routed_experts is not None), None)
+    if routed is None:  # all-None batches merge to None untouched; all-present skip the fill
         return
-    layers_topk = present[0].shape[-3:-1]  # (num_moe_layers, topk), fixed by the model
-    dtype = present[0].dtype
+    layers, topk = routed.shape[-3:-1]  # fixed by the model; routed_experts is (..., L, topk, T)
     for it in items:
         if it.routed_experts is None:
-            seq = it.sequences  # (..., T); routed_experts is (..., num_moe_layers, topk, T)
-            it.routed_experts = torch.full((*seq.shape[:-1], *layers_topk, seq.shape[-1]), -1, dtype=dtype)
+            *lead, seq = it.sequences.shape  # seq-aligned with sequences (..., T)
+            it.routed_experts = torch.full((*lead, layers, topk, seq), -1, dtype=routed.dtype)
 
 
 @dataclass
