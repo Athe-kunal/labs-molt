@@ -48,30 +48,9 @@ API, one trainable actor, clean enough to read end-to-end.
 
 Three boxes. One async loop.
 
-```mermaid
-flowchart LR
-    classDef agent   fill:#10b981,color:#ffffff,stroke:#059669,stroke-width:0px,rx:14,ry:14
-    classDef rollout fill:#2563eb,color:#ffffff,stroke:#1d4ed8,stroke-width:0px,rx:14,ry:14
-    classDef trainer fill:#7c3aed,color:#ffffff,stroke:#6d28d9,stroke-width:0px,rx:14,ry:14
-    classDef bridge  fill:#0f172a,color:#cbd5e1,stroke:#1e293b,stroke-width:0px,rx:14,ry:14
-
-    A["<b>Agent</b><br/>Env · ChatAgent<br/><i>your Python</i>"]:::agent
-    R["<b>vLLM Rollout</b><br/>async · TP · EP<br/><i>multimodal · chat server</i>"]:::rollout
-    Q[("Ray async queue<br/><i>partial rollout</i>")]:::bridge
-    T["<b>PolicyActor</b><br/>AutoModel + FSDP2<br/><i>TP · EP · CP · MoE</i>"]:::trainer
-
-    A -- "prompts" --> R
-    R -- "tokens · logprobs" --> A
-    A -- "Trajectory" --> Q
-    Q -- "Experience" --> T
-    T -. "NCCL weight sync" .-> R
-
-    linkStyle 0 stroke:#10b981,stroke-width:1.8px
-    linkStyle 1 stroke:#2563eb,stroke-width:1.8px
-    linkStyle 2 stroke:#64748b,stroke-width:1.8px
-    linkStyle 3 stroke:#64748b,stroke-width:1.8px
-    linkStyle 4 stroke:#7c3aed,stroke-width:1.8px,stroke-dasharray:6 4
-```
+<p align="center">
+  <img src="assets/molt.jpg" alt="Molt architecture: Agent · vLLM rollout · Ray async queue · single-actor AutoModel/FSDP2 trainer, fully async" width="920"/>
+</p>
 
 **Ray** owns placement and the async queue between the three boxes — that
 is the entire runtime. The contract is **token-first**: token ids,
