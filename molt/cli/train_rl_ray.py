@@ -627,15 +627,6 @@ if __name__ == "__main__":
         help="Router path: number of runner-pool actors (rollouts + in-process reward grading)",
     )
     parser.add_argument(
-        "--rollout.rescore_logprobs",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Re-read each finished rollout's action logprobs (+R3 routing) through one extra prefill "
-        "pass. Recurrent linear-attention models (Qwen3.x GDN) have decode-vs-prefill kernel numerics "
-        "gaps; the training recompute is prefill-like, so decode-time logprobs leak engine kernel "
-        "noise into vllm_kl / the TIS ratio. Costs one prefill per trajectory.",
-    )
-    parser.add_argument(
         "--rollout.vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
     )
     parser.add_argument("--rollout.micro_batch_size", type=int, default=1)
@@ -866,8 +857,9 @@ if __name__ == "__main__":
                 "Off-policy rollout (--train.async_queue_size > 1 or --train.partial_rollout_enable) "
                 "produces tokens across weight broadcasts that the router path does NOT mask "
                 "(off_policy_len is always 0 over HTTP). Set --algo.advantage.is_correction_level "
-                "(token|seq|geo) to correct them, or run synchronously (--train.async_queue_size 1, no "
-                "--train.partial_rollout_enable)."
+                "(token|seq|geo) to correct them, or run strictly on-policy (--train.async_queue_size 1 "
+                "AND --train.force_sync_mode, no --train.partial_rollout_enable). Note: async_queue_size 1 "
+                "alone frees the rollout slot before the refit, so the next batch is still 1-step stale."
             )
         print(
             "[Warning] Rollout samples may be off-policy. Set "
