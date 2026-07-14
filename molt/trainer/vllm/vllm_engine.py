@@ -235,7 +235,12 @@ class RolloutRayActor:
         return sorted(missing)
 
     async def pause_generation(self):
-        await self.llm.pause_generation(mode="keep")
+        # clear_cache=False is load-bearing: the default clear_cache=True runs
+        # _reset_caches(reset_running_requests=True) even in mode="keep", which resets
+        # the in-flight (prefetched) rollout requests and wipes their captured routing
+        # (routed_experts) — silently defeating R3 for tokens that span a refit. Prefix
+        # cache invalidation is handled separately by reset_prefix_cache() below.
+        await self.llm.pause_generation(mode="keep", clear_cache=False)
 
     async def resume_generation(self):
         await self.llm.resume_generation()
