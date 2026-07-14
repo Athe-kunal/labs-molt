@@ -747,7 +747,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval.dataset", type=str, default=None, help="Path to the evaluation dataset")
     parser.add_argument("--eval.split", type=str, default="train")
     parser.add_argument("--eval.steps", type=int, default=-1, help="Evaluate every N steps; -1 disables eval.")
-    parser.add_argument("--eval.temperature", type=float, default=0.6, help="Temperature for evaluation")
+    parser.add_argument(
+        "--eval.temperature",
+        type=float,
+        default=None,
+        help="Eval temperature; falls back to --rollout.temperature when unset.",
+    )
     parser.add_argument(
         "--eval.top_p", type=float, default=None, help="Eval top-p; falls back to --rollout.top_p when unset."
     )
@@ -758,7 +763,10 @@ if __name__ == "__main__":
         help="Eval max new tokens; falls back to --rollout.max_new_tokens when unset.",
     )
     parser.add_argument(
-        "--eval.n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
+        "--eval.n_samples_per_prompt",
+        type=int,
+        default=None,
+        help="Eval samples per prompt; falls back to --rollout.n_samples_per_prompt when unset.",
     )
     parser.add_argument(
         "--eval.eval_at_start",

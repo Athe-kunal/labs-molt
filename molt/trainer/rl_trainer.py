@@ -674,13 +674,14 @@ class GenerateSamplesActor:
                     self._last_eval_step = global_step
                     self._next_eval_step = (global_step // eval_steps + 1) * eval_steps
                     logger.info(f"Starting async evaluation at step {global_step}...")
-                    eval_kwargs = {
-                        **self.generate_kwargs,
-                        "temperature": self.args.eval.temperature,
-                        "n_samples_per_prompt": self.args.eval.n_samples_per_prompt,
-                    }
-                    # Independent eval sampling: override only what the user set for eval;
-                    # unset knobs fall back to the rollout values already in generate_kwargs.
+                    # Independent eval sampling: any knob left unset (None) falls back to the
+                    # rollout value in generate_kwargs; override only what's set for eval.
+                    eval_n = self.args.eval.n_samples_per_prompt
+                    if eval_n is None:
+                        eval_n = self.args.rollout.n_samples_per_prompt
+                    eval_kwargs = {**self.generate_kwargs, "n_samples_per_prompt": eval_n}
+                    if self.args.eval.temperature is not None:
+                        eval_kwargs["temperature"] = self.args.eval.temperature
                     if self.args.eval.top_p is not None:
                         eval_kwargs["top_p"] = self.args.eval.top_p
                     if self.args.eval.max_new_tokens is not None:
@@ -698,9 +699,7 @@ class GenerateSamplesActor:
                     finally:
                         if not self._partial_rollout:
                             ray.get(self.vllm_lock.release.remote())
-                    eval_metrics = compute_eval_metrics(
-                        self.eval_dataloader, samples_list, self.args.eval.n_samples_per_prompt
-                    )
+                    eval_metrics = compute_eval_metrics(self.eval_dataloader, samples_list, eval_n)
                     logger.info(f"Async evaluation completed: {eval_metrics}")
                     self.rollout_queue.put(("eval", global_step, eval_metrics), block=True)
                     continue
