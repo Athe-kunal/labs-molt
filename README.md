@@ -605,10 +605,10 @@ If you use Molt in your research, please cite:
 ```bibtex
 @misc{molt2026,
   title        = {Molt: A Scalable PyTorch-Native Training Framework for Agentic Reinforcement Learning},
-  author       = {Jian Hu and contributors},
+  author       = {Molt Contributors},
   year         = {2026},
   howpublished = {\url{https://github.com/NVIDIA-NeMo/labs-molt}},
-  note         = {Technical report: \url{https://www.researchgate.net/publication/409325071_Molt_A_Scalable_PyTorch-Native_Training_Framework_for_Agentic_Reinforcement_Learning}}
+  doi          = {10.13140/RG.2.2.23375.65447}
 }
 ```
 
