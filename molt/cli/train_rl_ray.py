@@ -1040,9 +1040,9 @@ if __name__ == "__main__":
         if args.actor.freezing_steps == 0:
             print("[Warning] --algo.sao: the paper uses 10 critic-warmup steps, but --actor.freezing_steps is 0.")
         if not args.algo.advantage.no_whiten:
-            print(
-                "[Warning] --algo.sao runs single-rollout async; batch advantage whitening couples "
-                "unrelated samples on a noisy moving mean/std. Consider --algo.advantage.no_whiten."
+            raise ValueError(
+                "--algo.sao runs single-rollout async; batch advantage whitening couples unrelated "
+                "samples on a noisy moving mean/std. Set --algo.advantage.no_whiten."
             )
 
     if args.train.force_on_policy and args.train.max_epochs != 1:
