@@ -612,9 +612,9 @@ optimization — all on PyTorch + AutoModel.
 If you use Molt in your research, please cite:
 
 ```bibtex
-@misc{molt2026,
+@article{hu2026molt,
   title        = {Molt: A Scalable PyTorch-Native Training Framework for Agentic Reinforcement Learning},
-  author       = {Molt Contributors},
+  author       = {Jian Hu and Molt Contributors},
   year         = {2026},
   howpublished = {\url{https://github.com/NVIDIA-NeMo/labs-molt}},
   doi          = {10.13140/RG.2.2.23375.65447}
