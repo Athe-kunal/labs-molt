@@ -14,10 +14,10 @@
 # limitations under the License.
 
 import os
-import sys
 import platform
-
+import sys
 from datetime import datetime
+
 from setuptools import find_packages, setup
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
@@ -29,8 +29,12 @@ def _is_nightly():
 
 
 def _fetch_requirements(path):
+    # PyPI rejects direct-URL requirements: swap the git-pinned nemo-automodel for its
+    # PyPI release floor (R3 routing replay needs the newer git pin from requirements.txt,
+    # and fails fast with instructions) and drop dion (no PyPI dist; only the Muon knob uses it).
     with open(path, "r") as fd:
-        return [r.strip() for r in fd.readlines()]
+        reqs = [r.strip() for r in fd.readlines() if "git+" not in r]
+    return reqs + ["nemo-automodel>=0.5.0"]
 
 
 def _fetch_readme():
@@ -51,7 +55,7 @@ def _fetch_version():
 
 
 def _fetch_package_name():
-    return "molt-nightly" if _is_nightly() else "molt"
+    return "molt-rl-nightly" if _is_nightly() else "molt-rl"
 
 
 # Custom wheel class to modify the wheel name
@@ -90,7 +94,7 @@ setup(
     long_description_content_type="text/markdown",
     install_requires=_fetch_requirements("requirements.txt"),
     extras_require={
-        "vllm": ["vllm==0.24.0"],
+        "vllm": ["vllm==0.25.1"],
         "vllm_latest": ["vllm>=0.24.0"],
         "flash-attn-2": ["flash-attn==2.8.3"],
     },

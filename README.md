@@ -217,8 +217,12 @@ bash examples/scripts/docker_run.sh "python -c 'import vllm, transformer_engine;
 For local (non-container) development:
 
 ```bash
-pip install -e ".[vllm]"
+pip install "molt-rl[vllm]"      # released package from PyPI, with the pinned vLLM
+pip install -e ".[vllm]"         # or editable, from this checkout
 ```
+
+(R3 routing replay and the Muon optimizer need the git-pinned deps from
+`requirements.txt`; they fail fast with instructions if the PyPI releases are too old.)
 
 ## 🚀 Quick Start
 
