@@ -280,7 +280,9 @@ class RouterGenerateClient:
         return SimpleNamespace(outputs=[gen], prompt_routed_experts=None), 0
 
 
-@ray.remote(num_cpus=0)  # I/O-bound (awaits router + desktop env); reserving CPU slots would cap the fleet
+@ray.remote(num_cpus=1)  # MUST reserve a CPU: with num_cpus=0 the SPREAD strategy can't balance
+# placement (every node looks empty), so runners pile onto a few nodes and their desktop-env VMs
+# starve/OOM (18204 connection refused). 1 CPU/runner lets Ray spread them evenly across nodes.
 class AgentRunnerActor:
     """One rollout driver process: runs the user's agent runner against the router.
 
