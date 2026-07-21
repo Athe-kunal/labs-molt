@@ -280,7 +280,7 @@ class RouterGenerateClient:
         return SimpleNamespace(outputs=[gen], prompt_routed_experts=None), 0
 
 
-@ray.remote
+@ray.remote(num_cpus=0)  # I/O-bound (awaits router + desktop env); reserving CPU slots would cap the fleet
 class AgentRunnerActor:
     """One rollout driver process: runs the user's agent runner against the router.
 
