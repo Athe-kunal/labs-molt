@@ -107,9 +107,9 @@ class Experience:
     truncated: torch.Tensor = tensor_field("episode", default=None)  # (B,) whether generation was truncated
     total_length: torch.Tensor = tensor_field("episode", default=None)  # (B,) prompt + response length
 
-    # Per-sample row id within the rollout batch (set to [i] per sample). After
-    # concat_experiences, len(index) = number of samples in this Experience —
-    # the advantage/merge logic relies on this count, so it is NOT pure metadata.
+    # Per-sample row id within the rollout batch (set to [i] per sample by
+    # make_experience). len(index) = number of samples in this Experience — the
+    # advantage/merge logic relies on this count, so it is NOT pure metadata.
     index: list[int] = None
 
     # Metadata (not part of RL computation)
@@ -181,70 +181,6 @@ class Experience:
                 setattr(self, name, to(value, device))
 
         return self
-
-    @staticmethod
-    def _merge_item(items: List, pad_value: int = 0) -> Union[torch.Tensor, list, dict, Any]:
-        """Merge a list of items into a single item.
-        Recursively merge tensors, lists and dicts.
-        For tensors, use zero_pad_sequences to merge sequences of different lengths.
-
-        Args:
-            items: List of items to merge
-            pad_value: Value used for padding tensors
-        """
-        if isinstance(items[0], torch.Tensor):
-            return zero_pad_sequences(items, side="right", value=pad_value)
-        elif isinstance(items[0], list):
-            return list(itertools.chain.from_iterable(items))
-        elif isinstance(items[0], dict):
-            result = {}
-            # Collect all values for each key
-            for d in items:
-                for key, value in d.items():
-                    if key not in result:
-                        result[key] = []
-                    result[key].append(value)
-            # Merge all values for each key at once
-            return {key: Experience._merge_item(values, pad_value) for key, values in result.items()}
-        elif items[0] is None:
-            return None
-        else:
-            raise ValueError(f"Unsupported type: {type(items[0])}")
-
-    @staticmethod
-    def concat_experiences(experiences_list: List["Experience"], pad_token_id) -> "Experience":
-        """Concatenate multiple experiences into one large experience.
-
-        Args:
-            experiences_list: List of Experience to concatenate
-            pad_token_id: Token id used for padding sequences
-
-        Returns:
-            A new Experience instance containing all the concatenated data
-        """
-        if not experiences_list:
-            return Experience()
-
-        # Get all field names from the dataclass
-        field_names = [f.name for f in fields(Experience)]
-
-        # Create result dictionary
-        result = {}
-
-        # A rollout with no captured routing has routed_experts=None; fill it (sized to its
-        # own sequence) before the field merge so a mix doesn't drop the batch's routing or
-        # crash on None.size(-1).
-        _fill_missing_routed_experts(experiences_list)
-
-        # Merge all fields
-        for name in field_names:
-            values = [getattr(e, name) for e in experiences_list]
-            # sequences pad with pad_token_id; routed_experts with the R3 -1 sentinel
-            # ("keep live routing" — 0 is a valid expert id); everything else with 0.
-            pad_value = pad_token_id if name == "sequences" else (-1 if name == "routed_experts" else 0)
-            result[name] = Experience._merge_item(values, pad_value)
-
-        return Experience(**result)
 
 
 # Batch manipulation utilities
