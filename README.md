@@ -218,11 +218,11 @@ For local (non-container) development:
 
 ```bash
 pip install "molt-rl[vllm]"      # released package from PyPI, with the pinned vLLM
-pip install -e ".[vllm]"         # or editable, from this checkout
+pip install -e ".[vllm]"         # or editable, from this checkout (exact git-pinned AutoModel)
 ```
 
-(R3 routing replay and the Muon optimizer need the git-pinned deps from
-`requirements.txt`; they fail fast with instructions if the PyPI releases are too old.)
+(The PyPI release depends on AutoModel's PyPI release; source/editable installs pull the
+exact git pin automatically, which R3 routing replay and the Muon optimizer need.)
 
 ## 🚀 Quick Start
 
